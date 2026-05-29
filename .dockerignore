@@ -1,0 +1,8 @@
+data/*
+!data/.gitkeep
+.git
+.codex
+.agents
+__pycache__/
+*.pyc
+.DS_Store

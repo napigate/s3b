@@ -1,0 +1,12 @@
+services:
+  s3b:
+    build:
+      context: .
+      args:
+        PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.12-alpine}
+    container_name: s3b
+    ports:
+      - "${S3B_PORT:-8088}:8080"
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
