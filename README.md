@@ -8,6 +8,15 @@ Lightweight S3/MinIO browser and control panel with saved profiles and built-in 
 docker compose up --build
 ```
 
+Create a local `.env` from the committed template before changing runtime settings:
+
+```bash
+cp .env.example .env
+```
+
+Docker Compose reads `.env` automatically. Keep `.env` local; commit changes to
+`.env.example` when defaults should be shared.
+
 After startup:
 
 ```text

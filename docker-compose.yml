@@ -4,9 +4,13 @@ services:
       context: .
       args:
         PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.12-alpine}
+    environment:
+      S3B_HOST: ${S3B_HOST:-0.0.0.0}
+      S3B_PORT: ${S3B_APP_PORT:-8080}
+      S3B_DATA_DIR: ${S3B_DATA_DIR:-/data}
     container_name: s3b
     ports:
-      - "${S3B_PORT:-8088}:8080"
+      - "${S3B_HOST_PORT:-8088}:${S3B_APP_PORT:-8080}"
     volumes:
-      - ./data:/data
+      - "${S3B_DATA_PATH:-./data}:/data"
     restart: unless-stopped

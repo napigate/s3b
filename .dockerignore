@@ -1,8 +1,10 @@
 data/*
 !data/.gitkeep
+.env
 .git
 .codex
 .agents
+.idea
 __pycache__/
 *.pyc
 .DS_Store

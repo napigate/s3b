@@ -17,6 +17,8 @@ and inline user-facing notes in English.
 - Frontend: static HTML/CSS/JS in `app/static/`, no build step.
 - Docker entrypoint: `python3 /app/server.py`.
 - Default host port: `8088`, mapped to container port `8080`.
+- Runtime settings template: `.env.example`.
+- Local runtime settings file: `.env`, ignored by git.
 - Runtime data: `./data` mounted to `/data`.
 - Profile storage: `/data/profiles.json`.
 - `mc` config storage: `/data/mc`.
@@ -44,8 +46,11 @@ data. `data/profiles.json` is intentionally ignored; keep `data/.gitkeep`.
 - Prefer Python standard library and plain JS for this repo.
 - Keep user-facing strings English-only.
 - Do not add secrets, profile files, `mc` config, or generated cache files to git.
+- Do not commit `.env`; update `.env.example` for shared defaults.
 - Preserve the Docker `PYTHON_IMAGE` build arg; it is useful when Docker Hub is
   unavailable or a mirror is required.
+- Keep host port and container app port separate. Use `S3B_HOST_PORT` for the
+  host mapping and `S3B_APP_PORT` for the container/server port.
 - Keep `.dockerignore` aligned with `.gitignore` so runtime data does not enter
   the image build context.
 
