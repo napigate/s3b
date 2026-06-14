@@ -31,6 +31,8 @@ HOST = os.environ.get("S3B_HOST", "0.0.0.0")
 PORT = int(os.environ.get("S3B_PORT", "8080"))
 MAX_MC_OUTPUT = 2 * 1024 * 1024
 BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
+PROVIDERS = {"generic", "minio", "seaweedfs"}
+PATH_STYLES = {"auto", "on", "off"}
 
 DATA_LOCK = threading.RLock()
 
@@ -68,15 +70,19 @@ def save_profiles(data):
 
 
 def public_profile(profile):
+    provider = normalize_provider(profile.get("provider"), default="minio")
     return {
         "id": profile["id"],
         "name": profile.get("name", ""),
         "endpoint": profile.get("endpoint", ""),
         "access_key": profile.get("access_key", ""),
+        "provider": provider,
+        "path_style": normalize_path_style(profile.get("path_style"), provider),
         "insecure": bool(profile.get("insecure", False)),
         "created_at": profile.get("created_at"),
         "updated_at": profile.get("updated_at"),
         "alias": alias_for(profile),
+        "capabilities": profile_capabilities(provider),
     }
 
 
@@ -101,10 +107,52 @@ def normalize_endpoint(endpoint):
     return endpoint.rstrip("/")
 
 
+def normalize_provider(provider, default="generic"):
+    provider = str(provider or default).strip().lower()
+    if provider not in PROVIDERS:
+        raise ApiError(HTTPStatus.BAD_REQUEST, "Provider is invalid.")
+    return provider
+
+
+def normalize_path_style(path_style, provider):
+    path_style = str(path_style or "").strip().lower()
+    if not path_style:
+        path_style = "on" if provider == "seaweedfs" else "auto"
+    if path_style not in PATH_STYLES:
+        raise ApiError(HTTPStatus.BAD_REQUEST, "Path style is invalid.")
+    return path_style
+
+
+def profile_capabilities(provider):
+    minio_admin = provider == "minio"
+    return {
+        "object_browser": True,
+        "buckets": True,
+        "minio_anonymous_policy": minio_admin,
+        "minio_admin_commands": minio_admin,
+    }
+
+
+def requires_minio_policy(profile):
+    provider = normalize_provider(profile.get("provider"), default="minio")
+    if not profile_capabilities(provider)["minio_anonymous_policy"]:
+        raise ApiError(
+            HTTPStatus.NOT_IMPLEMENTED,
+            "Bucket anonymous policies use MinIO-specific mc commands. This profile should use its S3-compatible credentials or provider-specific access controls.",
+        )
+
+
 def require_text(payload, key, label):
     value = str(payload.get(key, "")).strip()
     if not value:
         raise ApiError(HTTPStatus.BAD_REQUEST, f"{label} is required.")
+    return value
+
+
+def require_secret_key(payload):
+    value = require_text(payload, "secret_key", "Secret Key")
+    if len(value) < 8:
+        raise ApiError(HTTPStatus.BAD_REQUEST, "Secret Key must be at least 8 characters because mc requires it.")
     return value
 
 
@@ -186,6 +234,7 @@ def run_mc_raw(profile, args, timeout=120, check=True):
 def ensure_alias(profile):
     ensure_data_files()
     alias = alias_for(profile)
+    provider = normalize_provider(profile.get("provider"), default="minio")
     cmd = mc_base(profile) + [
         "alias",
         "set",
@@ -195,6 +244,8 @@ def ensure_alias(profile):
         profile["secret_key"],
         "--api",
         "S3v4",
+        "--path",
+        normalize_path_style(profile.get("path_style"), provider),
     ]
     try:
         result = subprocess.run(
@@ -351,6 +402,7 @@ class S3BrowserHandler(BaseHTTPRequestHandler):
 
         if path == "/api/policy":
             profile = get_profile(self.query_one(qs, "profile_id"))
+            requires_minio_policy(profile)
             bucket = validate_bucket(self.query_one(qs, "bucket"))
             result = run_mc(
                 profile,
@@ -385,15 +437,17 @@ class S3BrowserHandler(BaseHTTPRequestHandler):
                 "name": require_text(payload, "name", "Profile name"),
                 "endpoint": normalize_endpoint(payload.get("endpoint")),
                 "access_key": require_text(payload, "access_key", "Access Key"),
-                "secret_key": require_text(payload, "secret_key", "Secret Key"),
+                "secret_key": require_secret_key(payload),
+                "provider": normalize_provider(payload.get("provider"), default="generic"),
                 "insecure": bool(payload.get("insecure", False)),
                 "created_at": now_iso(),
                 "updated_at": now_iso(),
             }
+            profile["path_style"] = normalize_path_style(payload.get("path_style"), profile["provider"])
+            ensure_alias(profile)
             data = load_profiles()
             data["profiles"].append(profile)
             save_profiles(data)
-            ensure_alias(profile)
             self.send_json({"ok": True, "profile": public_profile(profile)}, HTTPStatus.CREATED)
             return
 
@@ -418,6 +472,7 @@ class S3BrowserHandler(BaseHTTPRequestHandler):
         if path == "/api/policy":
             payload = self.read_json()
             profile = get_profile(require_text(payload, "profile_id", "Profile"))
+            requires_minio_policy(profile)
             bucket = validate_bucket(require_text(payload, "bucket", "Bucket name"))
             policy = require_text(payload, "policy", "Policy")
             if policy not in {"private", "download", "upload", "public"}:
@@ -473,7 +528,12 @@ class S3BrowserHandler(BaseHTTPRequestHandler):
                     if "access_key" in payload:
                         profile["access_key"] = require_text(payload, "access_key", "Access Key")
                     if str(payload.get("secret_key", "")).strip():
-                        profile["secret_key"] = require_text(payload, "secret_key", "Secret Key")
+                        profile["secret_key"] = require_secret_key(payload)
+                    if "provider" in payload:
+                        profile["provider"] = normalize_provider(payload.get("provider"), default="generic")
+                    if "path_style" in payload:
+                        provider = normalize_provider(profile.get("provider"), default="generic")
+                        profile["path_style"] = normalize_path_style(payload.get("path_style"), provider)
                     if "insecure" in payload:
                         profile["insecure"] = bool(payload.get("insecure", False))
                     profile["updated_at"] = now_iso()

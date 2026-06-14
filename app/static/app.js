@@ -24,6 +24,18 @@ const navItems = [
   ["settings", "Settings"],
 ];
 
+const providers = [
+  ["seaweedfs", "SeaweedFS"],
+  ["minio", "MinIO"],
+  ["generic", "Generic S3"],
+];
+
+const pathStyles = [
+  ["on", "Path-style"],
+  ["auto", "Auto"],
+  ["off", "Virtual-hosted"],
+];
+
 function escapeHtml(value) {
   return String(value ?? "")
     .replaceAll("&", "&amp;")
@@ -59,6 +71,22 @@ function setStatus(message, isError = false) {
   state.status = message || "";
   state.error = isError ? message || "" : "";
   render();
+}
+
+function providerLabel(provider) {
+  return providers.find(([value]) => value === provider)?.[1] || "Generic S3";
+}
+
+function profileProvider(profile = state.activeProfile) {
+  return profile?.provider || "generic";
+}
+
+function isMinioProfile(profile = state.activeProfile) {
+  return profileProvider(profile) === "minio";
+}
+
+function supportsMinioPolicy() {
+  return Boolean(state.activeProfile?.capabilities?.minio_anonymous_policy);
 }
 
 async function loadProfiles() {
@@ -313,6 +341,10 @@ function downloadObject(key) {
 
 async function loadPolicy() {
   if (!state.activeProfile || !state.bucket) return;
+  if (!supportsMinioPolicy()) {
+    setStatus("Anonymous bucket policies are MinIO-specific for this app.", true);
+    return;
+  }
   setBusy(true);
   try {
     const data = await api(`/api/policy?profile_id=${qs(state.activeProfile.id)}&bucket=${qs(state.bucket)}`);
@@ -328,6 +360,10 @@ async function loadPolicy() {
 
 async function setPolicy(policy) {
   if (!state.activeProfile || !state.bucket) return;
+  if (!supportsMinioPolicy()) {
+    setStatus("Anonymous bucket policies are MinIO-specific for this app.", true);
+    return;
+  }
   setBusy(true);
   try {
     const data = await api("/api/policy", {
@@ -397,6 +433,7 @@ function render() {
         <div>
           <div>${escapeHtml(state.activeProfile.name)}</div>
           <div class="profile-pill ltr">${escapeHtml(state.activeProfile.endpoint)}</div>
+          <div class="profile-pill">${escapeHtml(providerLabel(profileProvider()))} · ${escapeHtml(state.activeProfile.path_style || "auto")} path</div>
         </div>
         <nav class="nav">
           ${navItems
@@ -443,6 +480,7 @@ function renderLogin() {
                             ${profile.id === lastProfile ? '<span class="badge">Last used</span>' : ""}
                           </header>
                           <div class="muted ltr">${escapeHtml(profile.endpoint)}</div>
+                          <div class="muted">${escapeHtml(providerLabel(profile.provider))}</div>
                           <button class="primary" data-login="${escapeHtml(profile.id)}" ${state.busy ? "disabled" : ""}>Open</button>
                         </article>
                       `
@@ -467,22 +505,39 @@ function renderLogin() {
     event.preventDefault();
     createProfile(event.currentTarget);
   });
+  bindProfileControls(document.querySelector("#profile-create-form"));
 }
 
 function profileForm(profile = {}) {
+  const provider = profile.provider || "seaweedfs";
+  const pathStyle = profile.path_style || (provider === "seaweedfs" ? "on" : "auto");
   return `
     <form id="${profile.id ? "profile-update-form" : "profile-create-form"}">
       <label>Name
         <input name="name" value="${escapeHtml(profile.name || "")}" required autocomplete="off" />
       </label>
+      <label>Provider
+        <select name="provider" data-provider-select>
+          ${providers
+            .map(([value, label]) => `<option value="${value}" ${value === provider ? "selected" : ""}>${escapeHtml(label)}</option>`)
+            .join("")}
+        </select>
+      </label>
       <label>Endpoint
-        <input class="ltr" name="endpoint" value="${escapeHtml(profile.endpoint || "")}" placeholder="https://s3.example.com" required />
+        <input class="ltr" name="endpoint" value="${escapeHtml(profile.endpoint || "")}" placeholder="http://seaweedfs.example.com:8333" required />
       </label>
       <label>Access Key
         <input class="ltr" name="access_key" value="${escapeHtml(profile.access_key || "")}" required autocomplete="off" />
       </label>
       <label>Secret Key
         <input class="ltr" name="secret_key" type="password" ${profile.id ? 'placeholder="Unchanged"' : "required"} autocomplete="new-password" />
+      </label>
+      <label>S3 Path Lookup
+        <select name="path_style" data-path-style-select>
+          ${pathStyles
+            .map(([value, label]) => `<option value="${value}" ${value === pathStyle ? "selected" : ""}>${escapeHtml(label)}</option>`)
+            .join("")}
+        </select>
       </label>
       <label class="checkbox">
         <input name="insecure" type="checkbox" ${profile.insecure ? "checked" : ""} />
@@ -637,6 +692,24 @@ function renderBuckets() {
 }
 
 function renderPolicies() {
+  if (!supportsMinioPolicy()) {
+    return `
+      <section class="stack">
+        <div class="panel stack">
+          <h2>Provider Access Controls</h2>
+          <p class="muted">
+            This profile is configured as ${escapeHtml(providerLabel(profileProvider()))}. S3B keeps object browsing,
+            uploads, downloads, deletes, and bucket operations on standard S3 commands. The policy buttons here are
+            MinIO-specific anonymous policy commands and are disabled for this provider.
+          </p>
+          <p class="muted">
+            Use the MC tab for supported S3 commands, or configure SeaweedFS access keys and bucket policies on the
+            SeaweedFS side.
+          </p>
+        </div>
+      </section>
+    `;
+  }
   return `
     <section class="stack">
       <div class="panel toolbar">
@@ -655,13 +728,9 @@ function renderPolicies() {
 
 function renderMc() {
   const bucket = state.bucket || "bucket";
-  const examples = [
-    "ls {alias}",
-    `du {alias}/${bucket}`,
-    `anonymous get {alias}/${bucket}`,
-    `ilm ls {alias}/${bucket}`,
-    "admin info {alias}",
-  ];
+  const examples = isMinioProfile()
+    ? ["ls {alias}", `du {alias}/${bucket}`, `anonymous get {alias}/${bucket}`, `ilm ls {alias}/${bucket}`, "admin info {alias}"]
+    : ["ls {alias}", `mb {alias}/${bucket}`, `ls {alias}/${bucket}`, `du {alias}/${bucket}`, `rm {alias}/${bucket}/path/to/object`];
   return `
     <section class="stack">
       <form id="mc-form" class="panel">
@@ -696,6 +765,7 @@ function renderSettings() {
               <article class="profile-card">
                 <h3>${escapeHtml(profile.name)}</h3>
                 <div class="muted ltr">${escapeHtml(profile.endpoint)}</div>
+                <div class="muted">${escapeHtml(providerLabel(profile.provider))}</div>
                 <button data-login="${escapeHtml(profile.id)}" ${profile.id === state.activeProfile.id ? "disabled" : ""}>Open</button>
               </article>
             `
@@ -791,9 +861,23 @@ function bindView() {
     event.preventDefault();
     updateProfile(event.currentTarget);
   });
+  document.querySelectorAll("form").forEach(bindProfileControls);
   document.querySelector("[data-action=delete-profile]")?.addEventListener("click", () => deleteProfile());
   document.querySelectorAll("[data-login]").forEach((button) => {
     button.addEventListener("click", () => login(button.dataset.login));
+  });
+}
+
+function bindProfileControls(form) {
+  const providerSelect = form.querySelector("[data-provider-select]");
+  const pathStyleSelect = form.querySelector("[data-path-style-select]");
+  if (!providerSelect || !pathStyleSelect) return;
+  providerSelect.addEventListener("change", () => {
+    if (providerSelect.value === "seaweedfs") {
+      pathStyleSelect.value = "on";
+    } else if (providerSelect.value === "minio" && pathStyleSelect.value === "on") {
+      pathStyleSelect.value = "auto";
+    }
   });
 }
 
