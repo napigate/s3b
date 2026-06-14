@@ -1,6 +1,6 @@
 # S3B
 
-Lightweight S3-compatible browser and control panel with saved profiles and built-in `mc` execution.
+Lightweight S3-compatible browser and control panel with browser-stored profiles and built-in `mc` execution.
 
 ## Run
 
@@ -26,7 +26,10 @@ After startup:
 http://localhost:8088
 ```
 
-Profiles and `mc` settings are stored in `./data`. Secret keys are stored as plain text in that directory, so do not commit it.
+Profiles are stored in the current browser with IndexedDB. They are not stored
+in `./data` and are not shared with other users who open the same S3B server
+from another browser. The backend receives the active profile credentials per
+request and runs `mc` with a temporary config directory.
 
 If the default Docker registry is unavailable, override the base image:
 
@@ -38,7 +41,7 @@ PYTHON_IMAGE=your-registry/python:3.12-alpine docker compose up --build
 
 - Create and select profiles with provider, `endpoint`, `access key`, and `secret key`
 - SeaweedFS profile preset with path-style S3 lookup
-- Persist profiles for later sessions
+- Persist profiles in the browser for later sessions
 - Browse buckets and objects
 - Upload, download, and delete objects
 - Create and delete buckets

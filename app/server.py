@@ -3,6 +3,8 @@ import warnings
 
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
+import base64
+import binascii
 import cgi
 import json
 import mimetypes
@@ -12,7 +14,6 @@ import shlex
 import shutil
 import subprocess
 import tempfile
-import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -24,53 +25,22 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 
 ROOT_DIR = Path(__file__).resolve().parent
 STATIC_DIR = ROOT_DIR / "static"
-DATA_DIR = Path(os.environ.get("S3B_DATA_DIR", "/data")).resolve()
-PROFILE_FILE = DATA_DIR / "profiles.json"
-MC_CONFIG_DIR = DATA_DIR / "mc"
 HOST = os.environ.get("S3B_HOST", "0.0.0.0")
 PORT = int(os.environ.get("S3B_PORT", "8080"))
 MAX_MC_OUTPUT = 2 * 1024 * 1024
+PROFILE_HEADER = "X-S3B-Profile"
 BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
+ALIAS_RE = re.compile(r"[^A-Za-z0-9]+")
 PROVIDERS = {"generic", "minio", "seaweedfs"}
 PATH_STYLES = {"auto", "on", "off"}
-
-DATA_LOCK = threading.RLock()
 
 
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
 
 
-def ensure_data_files():
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    MC_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    if not PROFILE_FILE.exists():
-        save_profiles({"profiles": []})
-
-
-def load_profiles():
-    ensure_data_files()
-    with DATA_LOCK:
-        try:
-            with PROFILE_FILE.open("r", encoding="utf-8") as fh:
-                data = json.load(fh)
-        except (json.JSONDecodeError, FileNotFoundError):
-            data = {"profiles": []}
-        data.setdefault("profiles", [])
-        return data
-
-
-def save_profiles(data):
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with DATA_LOCK:
-        tmp = PROFILE_FILE.with_suffix(".tmp")
-        with tmp.open("w", encoding="utf-8") as fh:
-            json.dump(data, fh, ensure_ascii=False, indent=2)
-        tmp.replace(PROFILE_FILE)
-
-
 def public_profile(profile):
-    provider = normalize_provider(profile.get("provider"), default="minio")
+    provider = normalize_provider(profile.get("provider"), default="generic")
     return {
         "id": profile["id"],
         "name": profile.get("name", ""),
@@ -86,16 +56,9 @@ def public_profile(profile):
     }
 
 
-def get_profile(profile_id):
-    data = load_profiles()
-    for profile in data["profiles"]:
-        if profile.get("id") == profile_id:
-            return profile
-    raise ApiError(HTTPStatus.NOT_FOUND, "Profile was not found.")
-
-
 def alias_for(profile):
-    return "p_" + profile["id"].replace("-", "")
+    suffix = ALIAS_RE.sub("", str(profile.get("id", "")))[:48]
+    return "p_" + (suffix or "browser")
 
 
 def normalize_endpoint(endpoint):
@@ -134,7 +97,7 @@ def profile_capabilities(provider):
 
 
 def requires_minio_policy(profile):
-    provider = normalize_provider(profile.get("provider"), default="minio")
+    provider = normalize_provider(profile.get("provider"), default="generic")
     if not profile_capabilities(provider)["minio_anonymous_policy"]:
         raise ApiError(
             HTTPStatus.NOT_IMPLEMENTED,
@@ -154,6 +117,44 @@ def require_secret_key(payload):
     if len(value) < 8:
         raise ApiError(HTTPStatus.BAD_REQUEST, "Secret Key must be at least 8 characters because mc requires it.")
     return value
+
+
+def normalize_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def normalize_profile(payload):
+    if not isinstance(payload, dict):
+        raise ApiError(HTTPStatus.BAD_REQUEST, "Profile credentials are required.")
+    provider = normalize_provider(payload.get("provider"), default="generic")
+    created_at = str(payload.get("created_at") or now_iso())
+    updated_at = str(payload.get("updated_at") or now_iso())
+    return {
+        "id": str(payload.get("id") or uuid.uuid4()),
+        "name": require_text(payload, "name", "Profile name"),
+        "endpoint": normalize_endpoint(payload.get("endpoint")),
+        "access_key": require_text(payload, "access_key", "Access Key"),
+        "secret_key": require_secret_key(payload),
+        "provider": provider,
+        "path_style": normalize_path_style(payload.get("path_style"), provider),
+        "insecure": normalize_bool(payload.get("insecure", False)),
+        "created_at": created_at,
+        "updated_at": updated_at,
+    }
+
+
+def decode_profile_header(value):
+    if not value:
+        raise ApiError(HTTPStatus.BAD_REQUEST, "Profile credentials are required.")
+    try:
+        raw = base64.b64decode(value.encode("ascii"), validate=True).decode("utf-8")
+        return json.loads(raw)
+    except (binascii.Error, ValueError, json.JSONDecodeError, UnicodeDecodeError):
+        raise ApiError(HTTPStatus.BAD_REQUEST, "Profile credentials are invalid.")
 
 
 def validate_bucket(bucket):
@@ -182,9 +183,9 @@ def s3_target(profile, bucket=None, key=None):
     return target
 
 
-def mc_env():
+def mc_env(config_dir):
     env = os.environ.copy()
-    env["MC_CONFIG_DIR"] = str(MC_CONFIG_DIR)
+    env["MC_CONFIG_DIR"] = str(config_dir)
     return env
 
 
@@ -196,16 +197,17 @@ def mc_base(profile=None):
 
 
 def run_mc(profile, args, timeout=120, check=True):
-    ensure_alias(profile)
-    return run_mc_raw(profile, args, timeout=timeout, check=check)
+    with tempfile.TemporaryDirectory(prefix="s3b-mc-") as config_dir:
+        ensure_alias(profile, config_dir)
+        return run_mc_raw(profile, args, config_dir, timeout=timeout, check=check)
 
 
-def run_mc_raw(profile, args, timeout=120, check=True):
+def run_mc_raw(profile, args, config_dir, timeout=120, check=True):
     cmd = mc_base(profile) + list(args)
     try:
         result = subprocess.run(
             cmd,
-            env=mc_env(),
+            env=mc_env(config_dir),
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -227,14 +229,14 @@ def run_mc_raw(profile, args, timeout=120, check=True):
         "code": result.returncode,
         "stdout": stdout,
         "stderr": stderr,
-        "command": redact_command(cmd),
+        "command": redact_command(cmd, profile),
     }
 
 
-def ensure_alias(profile):
-    ensure_data_files()
+def ensure_alias(profile, config_dir):
+    Path(config_dir).mkdir(parents=True, exist_ok=True)
     alias = alias_for(profile)
-    provider = normalize_provider(profile.get("provider"), default="minio")
+    provider = normalize_provider(profile.get("provider"), default="generic")
     cmd = mc_base(profile) + [
         "alias",
         "set",
@@ -250,7 +252,7 @@ def ensure_alias(profile):
     try:
         result = subprocess.run(
             cmd,
-            env=mc_env(),
+            env=mc_env(config_dir),
             capture_output=True,
             text=True,
             timeout=30,
@@ -275,11 +277,18 @@ def trim_output(value):
     return value[:MAX_MC_OUTPUT] + "\n... output truncated ..."
 
 
-def redact_command(cmd):
+def redact_command(cmd, profile=None):
+    sensitive = set()
+    if profile:
+        sensitive.update(
+            value
+            for value in [profile.get("access_key"), profile.get("secret_key")]
+            if value
+        )
     redacted = []
     previous = None
     for part in cmd:
-        if previous in {"--secret-key", "secret_key"}:
+        if previous in {"--secret-key", "secret_key"} or part in sensitive:
             redacted.append("******")
         else:
             redacted.append(part)
@@ -362,12 +371,11 @@ class S3BrowserHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/profiles":
-            profiles = [public_profile(profile) for profile in load_profiles()["profiles"]]
-            self.send_json({"ok": True, "profiles": profiles})
+            self.send_json({"ok": True, "profiles": [], "storage": "browser"})
             return
 
         if path == "/api/buckets":
-            profile = get_profile(self.query_one(qs, "profile_id"))
+            profile = self.request_profile()
             result = run_mc(profile, ["ls", "--json", alias_for(profile)], check=False)
             self.send_json(
                 {
@@ -381,7 +389,7 @@ class S3BrowserHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/objects":
-            profile = get_profile(self.query_one(qs, "profile_id"))
+            profile = self.request_profile()
             bucket = validate_bucket(self.query_one(qs, "bucket"))
             prefix = clean_key(self.query_one(qs, "prefix", required=False))
             target = s3_target(profile, bucket, prefix)
@@ -401,7 +409,7 @@ class S3BrowserHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/policy":
-            profile = get_profile(self.query_one(qs, "profile_id"))
+            profile = self.request_profile()
             requires_minio_policy(profile)
             bucket = validate_bucket(self.query_one(qs, "bucket"))
             result = run_mc(
@@ -421,7 +429,14 @@ class S3BrowserHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/download":
-            self.handle_download(qs)
+            profile = self.request_profile()
+            self.handle_download(
+                profile,
+                {
+                    "bucket": self.query_one(qs, "bucket"),
+                    "key": self.query_one(qs, "key"),
+                },
+            )
             return
 
         self.serve_static(path)
@@ -432,35 +447,23 @@ class S3BrowserHandler(BaseHTTPRequestHandler):
 
         if path == "/api/profiles":
             payload = self.read_json()
-            profile = {
-                "id": str(uuid.uuid4()),
-                "name": require_text(payload, "name", "Profile name"),
-                "endpoint": normalize_endpoint(payload.get("endpoint")),
-                "access_key": require_text(payload, "access_key", "Access Key"),
-                "secret_key": require_secret_key(payload),
-                "provider": normalize_provider(payload.get("provider"), default="generic"),
-                "insecure": bool(payload.get("insecure", False)),
-                "created_at": now_iso(),
-                "updated_at": now_iso(),
-            }
-            profile["path_style"] = normalize_path_style(payload.get("path_style"), profile["provider"])
-            ensure_alias(profile)
-            data = load_profiles()
-            data["profiles"].append(profile)
-            save_profiles(data)
+            profile = normalize_profile(payload.get("profile", payload))
+            with tempfile.TemporaryDirectory(prefix="s3b-mc-") as config_dir:
+                ensure_alias(profile, config_dir)
             self.send_json({"ok": True, "profile": public_profile(profile)}, HTTPStatus.CREATED)
             return
 
         if path == "/api/login":
             payload = self.read_json()
-            profile = get_profile(require_text(payload, "profile_id", "Profile"))
-            ensure_alias(profile)
+            profile = self.request_profile(payload)
+            with tempfile.TemporaryDirectory(prefix="s3b-mc-") as config_dir:
+                ensure_alias(profile, config_dir)
             self.send_json({"ok": True, "profile": public_profile(profile)})
             return
 
         if path == "/api/buckets":
             payload = self.read_json()
-            profile = get_profile(require_text(payload, "profile_id", "Profile"))
+            profile = self.request_profile(payload)
             bucket = validate_bucket(require_text(payload, "bucket", "Bucket name"))
             result = run_mc(profile, ["mb", s3_target(profile, bucket)], check=False)
             self.send_json(
@@ -471,7 +474,7 @@ class S3BrowserHandler(BaseHTTPRequestHandler):
 
         if path == "/api/policy":
             payload = self.read_json()
-            profile = get_profile(require_text(payload, "profile_id", "Profile"))
+            profile = self.request_profile(payload)
             requires_minio_policy(profile)
             bucket = validate_bucket(require_text(payload, "bucket", "Bucket name"))
             policy = require_text(payload, "policy", "Policy")
@@ -490,7 +493,7 @@ class S3BrowserHandler(BaseHTTPRequestHandler):
 
         if path == "/api/mc":
             payload = self.read_json()
-            profile = get_profile(require_text(payload, "profile_id", "Profile"))
+            profile = self.request_profile(payload)
             args_text = str(payload.get("args", "")).strip()
             if args_text.startswith("mc "):
                 args_text = args_text[3:].strip()
@@ -510,38 +513,24 @@ class S3BrowserHandler(BaseHTTPRequestHandler):
             self.handle_upload()
             return
 
+        if path == "/api/download":
+            payload = self.read_json()
+            profile = self.request_profile(payload)
+            self.handle_download(profile, payload)
+            return
+
         raise ApiError(HTTPStatus.NOT_FOUND, "API route was not found.")
 
     def route_put(self):
         parsed = urlparse(self.path)
         path = parsed.path
         if path.startswith("/api/profiles/"):
-            profile_id = path.rsplit("/", 1)[-1]
             payload = self.read_json()
-            data = load_profiles()
-            for profile in data["profiles"]:
-                if profile.get("id") == profile_id:
-                    if "name" in payload:
-                        profile["name"] = require_text(payload, "name", "Profile name")
-                    if "endpoint" in payload:
-                        profile["endpoint"] = normalize_endpoint(payload.get("endpoint"))
-                    if "access_key" in payload:
-                        profile["access_key"] = require_text(payload, "access_key", "Access Key")
-                    if str(payload.get("secret_key", "")).strip():
-                        profile["secret_key"] = require_secret_key(payload)
-                    if "provider" in payload:
-                        profile["provider"] = normalize_provider(payload.get("provider"), default="generic")
-                    if "path_style" in payload:
-                        provider = normalize_provider(profile.get("provider"), default="generic")
-                        profile["path_style"] = normalize_path_style(payload.get("path_style"), provider)
-                    if "insecure" in payload:
-                        profile["insecure"] = bool(payload.get("insecure", False))
-                    profile["updated_at"] = now_iso()
-                    save_profiles(data)
-                    ensure_alias(profile)
-                    self.send_json({"ok": True, "profile": public_profile(profile)})
-                    return
-            raise ApiError(HTTPStatus.NOT_FOUND, "Profile was not found.")
+            profile = self.request_profile(payload)
+            with tempfile.TemporaryDirectory(prefix="s3b-mc-") as config_dir:
+                ensure_alias(profile, config_dir)
+            self.send_json({"ok": True, "profile": public_profile(profile)})
+            return
         raise ApiError(HTTPStatus.NOT_FOUND, "API route was not found.")
 
     def route_delete(self):
@@ -550,19 +539,12 @@ class S3BrowserHandler(BaseHTTPRequestHandler):
         qs = parse_qs(parsed.query)
 
         if path.startswith("/api/profiles/"):
-            profile_id = path.rsplit("/", 1)[-1]
-            data = load_profiles()
-            before = len(data["profiles"])
-            data["profiles"] = [p for p in data["profiles"] if p.get("id") != profile_id]
-            if len(data["profiles"]) == before:
-                raise ApiError(HTTPStatus.NOT_FOUND, "Profile was not found.")
-            save_profiles(data)
             self.send_json({"ok": True})
             return
 
         if path.startswith("/api/buckets/"):
             bucket = validate_bucket(unquote(path.rsplit("/", 1)[-1]))
-            profile = get_profile(self.query_one(qs, "profile_id"))
+            profile = self.request_profile()
             args = ["rb"]
             if self.query_one(qs, "force", required=False) in {"1", "true", "yes"}:
                 args.append("--force")
@@ -575,7 +557,7 @@ class S3BrowserHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/object":
-            profile = get_profile(self.query_one(qs, "profile_id"))
+            profile = self.request_profile()
             bucket = validate_bucket(self.query_one(qs, "bucket"))
             key = clean_key(self.query_one(qs, "key"))
             args = ["rm"]
@@ -605,7 +587,7 @@ class S3BrowserHandler(BaseHTTPRequestHandler):
             },
             keep_blank_values=True,
         )
-        profile = get_profile(str(form.getvalue("profile_id", "")))
+        profile = self.profile_from_form(form)
         bucket = validate_bucket(str(form.getvalue("bucket", "")))
         prefix = clean_key(str(form.getvalue("prefix", "")))
         file_field = form["file"] if "file" in form else None
@@ -631,10 +613,9 @@ class S3BrowserHandler(BaseHTTPRequestHandler):
                 except FileNotFoundError:
                     pass
 
-    def handle_download(self, qs):
-        profile = get_profile(self.query_one(qs, "profile_id"))
-        bucket = validate_bucket(self.query_one(qs, "bucket"))
-        key = clean_key(self.query_one(qs, "key"))
+    def handle_download(self, profile, payload):
+        bucket = validate_bucket(str(payload.get("bucket", "")))
+        key = clean_key(str(payload.get("key", "")))
         filename = Path(key).name or "object"
         with tempfile.TemporaryDirectory() as tmpdir:
             dest = Path(tmpdir) / filename
@@ -686,6 +667,20 @@ class S3BrowserHandler(BaseHTTPRequestHandler):
             return ""
         return values[0]
 
+    def request_profile(self, payload=None):
+        if isinstance(payload, dict) and isinstance(payload.get("profile"), dict):
+            return normalize_profile(payload["profile"])
+        return normalize_profile(decode_profile_header(self.headers.get(PROFILE_HEADER)))
+
+    def profile_from_form(self, form):
+        raw = str(form.getvalue("profile", "") or "")
+        if raw:
+            try:
+                return normalize_profile(json.loads(raw))
+            except json.JSONDecodeError:
+                raise ApiError(HTTPStatus.BAD_REQUEST, "Profile credentials are invalid.")
+        return self.request_profile()
+
     def send_json(self, payload, status=HTTPStatus.OK):
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
@@ -697,7 +692,6 @@ class S3BrowserHandler(BaseHTTPRequestHandler):
 
 
 def main():
-    ensure_data_files()
     server = ThreadingHTTPServer((HOST, PORT), S3BrowserHandler)
     print(f"S3B listening on http://{HOST}:{PORT}")
     server.serve_forever()

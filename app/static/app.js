@@ -15,6 +15,8 @@ const state = {
 };
 
 const app = document.querySelector("#app");
+const profileDbName = "s3b-browser-profiles";
+const profileStoreName = "profiles";
 
 const navItems = [
   ["browser", "Object Browser"],
@@ -49,10 +51,179 @@ function qs(value) {
   return encodeURIComponent(value ?? "");
 }
 
+function txDone(tx) {
+  return new Promise((resolve, reject) => {
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error);
+    tx.onabort = () => reject(tx.error);
+  });
+}
+
+function openProfileDb() {
+  return new Promise((resolve, reject) => {
+    if (!("indexedDB" in window)) {
+      reject(new Error("Browser profile database is unavailable."));
+      return;
+    }
+    const request = indexedDB.open(profileDbName, 1);
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(profileStoreName)) {
+        db.createObjectStore(profileStoreName, { keyPath: "id" });
+      }
+    };
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+  });
+}
+
+async function listStoredProfiles() {
+  const db = await openProfileDb();
+  try {
+    const tx = db.transaction(profileStoreName, "readonly");
+    const request = tx.objectStore(profileStoreName).getAll();
+    const profiles = await new Promise((resolve, reject) => {
+      request.onsuccess = () => resolve(request.result || []);
+      request.onerror = () => reject(request.error);
+    });
+    await txDone(tx);
+    return profiles.sort((a, b) => (b.updated_at || "").localeCompare(a.updated_at || ""));
+  } finally {
+    db.close();
+  }
+}
+
+async function getStoredProfile(id) {
+  const db = await openProfileDb();
+  try {
+    const tx = db.transaction(profileStoreName, "readonly");
+    const request = tx.objectStore(profileStoreName).get(id);
+    const profile = await new Promise((resolve, reject) => {
+      request.onsuccess = () => resolve(request.result || null);
+      request.onerror = () => reject(request.error);
+    });
+    await txDone(tx);
+    return profile;
+  } finally {
+    db.close();
+  }
+}
+
+async function saveStoredProfile(profile) {
+  const db = await openProfileDb();
+  try {
+    const tx = db.transaction(profileStoreName, "readwrite");
+    tx.objectStore(profileStoreName).put(profile);
+    await txDone(tx);
+  } finally {
+    db.close();
+  }
+}
+
+async function deleteStoredProfile(id) {
+  const db = await openProfileDb();
+  try {
+    const tx = db.transaction(profileStoreName, "readwrite");
+    tx.objectStore(profileStoreName).delete(id);
+    await txDone(tx);
+  } finally {
+    db.close();
+  }
+}
+
+function newProfileId() {
+  if (crypto.randomUUID) {
+    return crypto.randomUUID();
+  }
+  return `profile-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+function capabilitiesForProvider(provider) {
+  const minio = provider === "minio";
+  return {
+    object_browser: true,
+    buckets: true,
+    minio_anonymous_policy: minio,
+    minio_admin_commands: minio,
+  };
+}
+
+function buildProfileFromForm(form, existing = null) {
+  const payload = Object.fromEntries(new FormData(form).entries());
+  const provider = String(payload.provider || existing?.provider || "generic").trim();
+  const now = new Date().toISOString();
+  const secret = String(payload.secret_key || "").trim() || existing?.secret_key || "";
+  const profile = {
+    id: existing?.id || newProfileId(),
+    name: String(payload.name || "").trim(),
+    provider,
+    endpoint: String(payload.endpoint || "").trim(),
+    access_key: String(payload.access_key || "").trim(),
+    secret_key: secret,
+    path_style: String(payload.path_style || (provider === "seaweedfs" ? "on" : "auto")).trim(),
+    insecure: form.querySelector("[name=insecure]").checked,
+    created_at: existing?.created_at || now,
+    updated_at: now,
+    capabilities: capabilitiesForProvider(provider),
+  };
+  return profile;
+}
+
+function mergePublicProfile(localProfile, publicProfile) {
+  return {
+    ...localProfile,
+    ...publicProfile,
+    secret_key: localProfile.secret_key,
+  };
+}
+
+function profileForRequest(profile = state.activeProfile) {
+  if (!profile) return null;
+  return {
+    id: profile.id,
+    name: profile.name,
+    provider: profile.provider,
+    endpoint: profile.endpoint,
+    access_key: profile.access_key,
+    secret_key: profile.secret_key,
+    path_style: profile.path_style,
+    insecure: Boolean(profile.insecure),
+    created_at: profile.created_at,
+    updated_at: profile.updated_at,
+  };
+}
+
+function encodeBase64Json(value) {
+  const bytes = new TextEncoder().encode(JSON.stringify(value));
+  let binary = "";
+  bytes.forEach((byte) => {
+    binary += String.fromCharCode(byte);
+  });
+  return btoa(binary);
+}
+
+function profileRequestHeaders(profile = state.activeProfile) {
+  const headers = new Headers();
+  const requestProfile = profileForRequest(profile);
+  if (requestProfile) {
+    headers.set("X-S3B-Profile", encodeBase64Json(requestProfile));
+  }
+  return headers;
+}
+
 async function api(path, options = {}) {
+  const headers = new Headers(options.headers || {});
+  if (!(options.body instanceof FormData) && !headers.has("Content-Type")) {
+    headers.set("Content-Type", "application/json");
+  }
+  const requestProfile = options.profile === false ? null : options.profile || state.activeProfile;
+  if (requestProfile) {
+    headers.set("X-S3B-Profile", encodeBase64Json(profileForRequest(requestProfile)));
+  }
+  const fetchOptions = { ...options, headers };
+  delete fetchOptions.profile;
   const response = await fetch(path, {
-    headers: options.body instanceof FormData ? undefined : { "Content-Type": "application/json" },
-    ...options,
+    ...fetchOptions,
   });
   const contentType = response.headers.get("content-type") || "";
   const data = contentType.includes("application/json") ? await response.json() : {};
@@ -86,13 +257,12 @@ function isMinioProfile(profile = state.activeProfile) {
 }
 
 function supportsMinioPolicy() {
-  return Boolean(state.activeProfile?.capabilities?.minio_anonymous_policy);
+  return isMinioProfile() || Boolean(state.activeProfile?.capabilities?.minio_anonymous_policy);
 }
 
 async function loadProfiles() {
   try {
-    const data = await api("/api/profiles");
-    state.profiles = data.profiles || [];
+    state.profiles = await listStoredProfiles();
   } catch (error) {
     state.error = error.message;
   }
@@ -102,11 +272,16 @@ async function loadProfiles() {
 async function login(profileId) {
   setBusy(true);
   try {
+    const profile = await getStoredProfile(profileId);
+    if (!profile) {
+      throw new Error("Profile was not found in this browser.");
+    }
     const data = await api("/api/login", {
       method: "POST",
-      body: JSON.stringify({ profile_id: profileId }),
+      body: JSON.stringify({ profile: profileForRequest(profile) }),
+      profile: false,
     });
-    state.activeProfile = data.profile;
+    state.activeProfile = mergePublicProfile(profile, data.profile);
     localStorage.setItem("s3b.lastProfile", profileId);
     state.view = "browser";
     state.prefix = "";
@@ -121,15 +296,22 @@ async function login(profileId) {
 
 async function createProfile(form) {
   setBusy(true);
-  const payload = Object.fromEntries(new FormData(form).entries());
-  payload.insecure = form.querySelector("[name=insecure]").checked;
+  const profile = buildProfileFromForm(form);
   try {
-    const data = await api("/api/profiles", {
+    const data = await api("/api/login", {
       method: "POST",
-      body: JSON.stringify(payload),
+      body: JSON.stringify({ profile: profileForRequest(profile) }),
+      profile: false,
     });
-    state.profiles.push(data.profile);
-    await login(data.profile.id);
+    const storedProfile = mergePublicProfile(profile, data.profile);
+    await saveStoredProfile(storedProfile);
+    state.profiles = await listStoredProfiles();
+    state.activeProfile = storedProfile;
+    localStorage.setItem("s3b.lastProfile", storedProfile.id);
+    state.view = "browser";
+    state.prefix = "";
+    state.output = "";
+    await loadBuckets(false);
   } catch (error) {
     setStatus(error.message, true);
   } finally {
@@ -140,15 +322,17 @@ async function createProfile(form) {
 async function updateProfile(form) {
   if (!state.activeProfile) return;
   setBusy(true);
-  const payload = Object.fromEntries(new FormData(form).entries());
-  payload.insecure = form.querySelector("[name=insecure]").checked;
+  const profile = buildProfileFromForm(form, state.activeProfile);
   try {
-    const data = await api(`/api/profiles/${state.activeProfile.id}`, {
-      method: "PUT",
-      body: JSON.stringify(payload),
+    const data = await api("/api/login", {
+      method: "POST",
+      body: JSON.stringify({ profile: profileForRequest(profile) }),
+      profile: false,
     });
-    state.activeProfile = data.profile;
-    state.profiles = state.profiles.map((item) => (item.id === data.profile.id ? data.profile : item));
+    const storedProfile = mergePublicProfile(profile, data.profile);
+    await saveStoredProfile(storedProfile);
+    state.activeProfile = storedProfile;
+    state.profiles = await listStoredProfiles();
     setStatus("Saved.");
   } catch (error) {
     setStatus(error.message, true);
@@ -161,12 +345,13 @@ async function deleteProfile() {
   if (!state.activeProfile || !confirm("Delete this profile?")) return;
   setBusy(true);
   try {
-    await api(`/api/profiles/${state.activeProfile.id}`, { method: "DELETE" });
+    await deleteStoredProfile(state.activeProfile.id);
     localStorage.removeItem("s3b.lastProfile");
     state.activeProfile = null;
     state.buckets = [];
     state.objects = [];
-    await loadProfiles();
+    state.profiles = await listStoredProfiles();
+    render();
   } catch (error) {
     setStatus(error.message, true);
   } finally {
@@ -178,7 +363,7 @@ async function loadBuckets(shouldRender = true) {
   if (!state.activeProfile) return;
   if (shouldRender) setBusy(true);
   try {
-    const data = await api(`/api/buckets?profile_id=${qs(state.activeProfile.id)}`);
+    const data = await api("/api/buckets");
     state.buckets = normalizeBuckets(data.items || []);
     if (!state.bucket && state.buckets.length) {
       state.bucket = state.buckets[0].name;
@@ -217,7 +402,7 @@ async function createBucket(form) {
   try {
     await api("/api/buckets", {
       method: "POST",
-      body: JSON.stringify({ profile_id: state.activeProfile.id, bucket }),
+      body: JSON.stringify({ bucket }),
     });
     form.reset();
     state.bucket = bucket;
@@ -234,7 +419,7 @@ async function deleteBucket(bucket, force = false) {
   if (!confirm(`Delete bucket ${bucket}?`)) return;
   setBusy(true);
   try {
-    await api(`/api/buckets/${qs(bucket)}?profile_id=${qs(state.activeProfile.id)}&force=${force ? "1" : "0"}`, {
+    await api(`/api/buckets/${qs(bucket)}?force=${force ? "1" : "0"}`, {
       method: "DELETE",
     });
     if (state.bucket === bucket) {
@@ -255,9 +440,7 @@ async function loadObjects(shouldRender = true) {
   if (!state.activeProfile || !state.bucket) return;
   if (shouldRender) setBusy(true);
   try {
-    const data = await api(
-      `/api/objects?profile_id=${qs(state.activeProfile.id)}&bucket=${qs(state.bucket)}&prefix=${qs(state.prefix)}`
-    );
+    const data = await api(`/api/objects?bucket=${qs(state.bucket)}&prefix=${qs(state.prefix)}`);
     state.objects = normalizeObjects(data.items || []);
   } catch (error) {
     state.objects = [];
@@ -301,7 +484,7 @@ async function uploadObject(input) {
   if (!state.activeProfile || !state.bucket || !input.files.length) return;
   setBusy(true);
   const body = new FormData();
-  body.append("profile_id", state.activeProfile.id);
+  body.append("profile", JSON.stringify(profileForRequest()));
   body.append("bucket", state.bucket);
   body.append("prefix", state.prefix);
   body.append("file", input.files[0]);
@@ -321,10 +504,7 @@ async function deleteObject(key, recursive = false) {
   if (!confirm("Delete this object?")) return;
   setBusy(true);
   try {
-    await api(
-      `/api/object?profile_id=${qs(state.activeProfile.id)}&bucket=${qs(state.bucket)}&key=${qs(key)}&recursive=${recursive ? "1" : "0"}`,
-      { method: "DELETE" }
-    );
+    await api(`/api/object?bucket=${qs(state.bucket)}&key=${qs(key)}&recursive=${recursive ? "1" : "0"}`, { method: "DELETE" });
     await loadObjects(false);
     setStatus("Deleted.");
   } catch (error) {
@@ -334,9 +514,37 @@ async function deleteObject(key, recursive = false) {
   }
 }
 
-function downloadObject(key) {
-  const url = `/api/download?profile_id=${qs(state.activeProfile.id)}&bucket=${qs(state.bucket)}&key=${qs(key)}`;
-  window.location.href = url;
+async function downloadObject(key) {
+  if (!state.activeProfile || !state.bucket) return;
+  setBusy(true);
+  try {
+    const headers = profileRequestHeaders();
+    headers.set("Content-Type", "application/json");
+    const response = await fetch("/api/download", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ bucket: state.bucket, key }),
+    });
+    if (!response.ok) {
+      const contentType = response.headers.get("content-type") || "";
+      const data = contentType.includes("application/json") ? await response.json() : {};
+      throw new Error(data.error || response.statusText);
+    }
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = key.split("/").filter(Boolean).pop() || "object";
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+    setStatus("Downloaded.");
+  } catch (error) {
+    setStatus(error.message, true);
+  } finally {
+    setBusy(false);
+  }
 }
 
 async function loadPolicy() {
@@ -347,7 +555,7 @@ async function loadPolicy() {
   }
   setBusy(true);
   try {
-    const data = await api(`/api/policy?profile_id=${qs(state.activeProfile.id)}&bucket=${qs(state.bucket)}`);
+    const data = await api(`/api/policy?bucket=${qs(state.bucket)}`);
     state.policyText = data.policy || "";
     setStatus("Loaded.");
   } catch (error) {
@@ -368,7 +576,7 @@ async function setPolicy(policy) {
   try {
     const data = await api("/api/policy", {
       method: "POST",
-      body: JSON.stringify({ profile_id: state.activeProfile.id, bucket: state.bucket, policy }),
+      body: JSON.stringify({ bucket: state.bucket, policy }),
     });
     state.output = [data.stdout, data.stderr].filter(Boolean).join("\n");
     await loadPolicy();
@@ -387,7 +595,7 @@ async function runMc(form) {
   try {
     const data = await api("/api/mc", {
       method: "POST",
-      body: JSON.stringify({ profile_id: state.activeProfile.id, args }),
+      body: JSON.stringify({ args }),
     });
     const command = `$ ${escapeForOutput(["mc", ...(data.command || []).slice(1)].join(" "))}`;
     const stdout = data.stdout || "";
@@ -403,7 +611,13 @@ async function runMc(form) {
 }
 
 function escapeForOutput(value) {
-  return String(value).replace(state.activeProfile?.access_key || "", "******");
+  let output = String(value);
+  for (const secret of [state.activeProfile?.access_key, state.activeProfile?.secret_key]) {
+    if (secret) {
+      output = output.replaceAll(secret, "******");
+    }
+  }
+  return output;
 }
 
 function formatSize(size) {
@@ -466,8 +680,9 @@ function renderLogin() {
         <section class="login-card">
           <div class="topbar">
             <h1>S3B</h1>
-            <span class="badge">${state.profiles.length} profiles</span>
+            <span class="badge">${state.profiles.length} browser profiles</span>
           </div>
+          <p class="muted">Profiles are stored only in this browser.</p>
           ${
             state.profiles.length
               ? `<div class="profile-list">
