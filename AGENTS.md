@@ -45,8 +45,8 @@ Do not commit runtime data; keep `data/.gitkeep`.
 - `mc` rejects secret keys shorter than 8 characters; keep this validation in
   place even though some SeaweedFS examples use shorter demo secrets.
 - The sidebar exposes Object Browser, Buckets, Policies, MC, and Settings.
-- Object Browser supports bucket selection, prefix navigation, upload, download,
-  and delete.
+- Object Browser supports bucket selection, prefix navigation, folder creation,
+  single-file and multi-file upload, download, and delete.
 - Buckets view supports create, delete, and force delete.
 - Policies view wraps `mc anonymous` commands for common anonymous policies and
   should stay disabled for non-MinIO providers such as SeaweedFS.

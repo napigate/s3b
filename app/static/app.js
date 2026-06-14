@@ -6,6 +6,7 @@ const state = {
   bucket: "",
   prefix: "",
   objects: [],
+  modal: null,
   policyText: "",
   mcArgs: "ls {alias}",
   output: "",
@@ -17,6 +18,7 @@ const state = {
 const app = document.querySelector("#app");
 const profileDbName = "s3b-browser-profiles";
 const profileStoreName = "profiles";
+const sessionStorageKey = "s3b.session.v1";
 
 const navItems = [
   ["browser", "Object Browser"],
@@ -37,6 +39,70 @@ const pathStyles = [
   ["auto", "Auto"],
   ["off", "Virtual-hosted"],
 ];
+
+const routeViews = new Set(navItems.map(([id]) => id));
+
+function normalizeView(view) {
+  return routeViews.has(view) ? view : "browser";
+}
+
+function readStoredSession() {
+  try {
+    return JSON.parse(localStorage.getItem(sessionStorageKey) || "{}") || {};
+  } catch {
+    return {};
+  }
+}
+
+function readRouteSession() {
+  const raw = window.location.hash.replace(/^#\/?/, "");
+  if (!raw) return { hasRoute: false };
+  const [rawView, rawQuery = ""] = raw.split("?");
+  const params = new URLSearchParams(rawQuery);
+  return {
+    hasRoute: true,
+    profileId: params.get("profile") || "",
+    view: rawView === "profiles" ? "profiles" : normalizeView(rawView),
+    bucket: params.get("bucket") || "",
+    prefix: params.get("prefix") || "",
+  };
+}
+
+function restoreTarget() {
+  const stored = readStoredSession();
+  const route = readRouteSession();
+  const hasRoute = route.hasRoute;
+  return {
+    profileId: hasRoute ? route.profileId || stored.profileId || "" : stored.profileId || localStorage.getItem("s3b.lastProfile") || "",
+    view: hasRoute ? route.view : stored.view || "browser",
+    bucket: hasRoute ? route.bucket : stored.bucket || "",
+    prefix: hasRoute ? route.prefix : stored.prefix || "",
+    hasRoute,
+  };
+}
+
+function persistSession() {
+  const view = state.activeProfile ? normalizeView(state.view) : "profiles";
+  const session = {
+    profileId: state.activeProfile?.id || "",
+    view,
+    bucket: state.bucket || "",
+    prefix: state.prefix || "",
+  };
+  localStorage.setItem(sessionStorageKey, JSON.stringify(session));
+  if (state.activeProfile?.id) {
+    localStorage.setItem("s3b.lastProfile", state.activeProfile.id);
+  }
+  const params = new URLSearchParams();
+  if (session.profileId) params.set("profile", session.profileId);
+  if (session.bucket) params.set("bucket", session.bucket);
+  if (session.prefix) params.set("prefix", session.prefix);
+  const query = params.toString();
+  const hash = `#/${view}${query ? `?${query}` : ""}`;
+  if (window.location.hash !== hash) {
+    history.replaceState(null, "", hash);
+  }
+}
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -244,6 +310,31 @@ function setStatus(message, isError = false) {
   render();
 }
 
+function openModal(name) {
+  state.modal = name;
+  render();
+  requestAnimationFrame(() => {
+    document.querySelector("[data-modal-close]")?.focus();
+  });
+}
+
+function closeModal() {
+  state.modal = null;
+  render();
+}
+
+async function selectBucket(bucket) {
+  if (!bucket || state.bucket === bucket) {
+    state.modal = null;
+    render();
+    return;
+  }
+  state.bucket = bucket;
+  state.prefix = "";
+  state.modal = null;
+  await loadObjects();
+}
+
 function providerLabel(provider) {
   return providers.find(([value]) => value === provider)?.[1] || "Generic S3";
 }
@@ -266,10 +357,18 @@ async function loadProfiles() {
   } catch (error) {
     state.error = error.message;
   }
+  const target = restoreTarget();
+  if (!state.activeProfile && target.profileId && target.view !== "profiles") {
+    const canRestore = state.profiles.some((profile) => profile.id === target.profileId);
+    if (canRestore) {
+      await login(target.profileId, { restore: target });
+      return;
+    }
+  }
   render();
 }
 
-async function login(profileId) {
+async function login(profileId, options = {}) {
   setBusy(true);
   try {
     const profile = await getStoredProfile(profileId);
@@ -282,11 +381,13 @@ async function login(profileId) {
       profile: false,
     });
     state.activeProfile = mergePublicProfile(profile, data.profile);
-    localStorage.setItem("s3b.lastProfile", profileId);
-    state.view = "browser";
-    state.prefix = "";
+    const restore = options.restore || null;
+    state.view = restore ? normalizeView(restore.view) : "browser";
+    state.bucket = restore?.bucket || "";
+    state.prefix = restore?.prefix || "";
     state.output = "";
     await loadBuckets(false);
+    persistSession();
   } catch (error) {
     setStatus(error.message, true);
   } finally {
@@ -307,11 +408,12 @@ async function createProfile(form) {
     await saveStoredProfile(storedProfile);
     state.profiles = await listStoredProfiles();
     state.activeProfile = storedProfile;
-    localStorage.setItem("s3b.lastProfile", storedProfile.id);
     state.view = "browser";
+    state.bucket = "";
     state.prefix = "";
     state.output = "";
     await loadBuckets(false);
+    persistSession();
   } catch (error) {
     setStatus(error.message, true);
   } finally {
@@ -349,8 +451,11 @@ async function deleteProfile() {
     localStorage.removeItem("s3b.lastProfile");
     state.activeProfile = null;
     state.buckets = [];
+    state.bucket = "";
+    state.prefix = "";
     state.objects = [];
     state.profiles = await listStoredProfiles();
+    persistSession();
     render();
   } catch (error) {
     setStatus(error.message, true);
@@ -365,12 +470,18 @@ async function loadBuckets(shouldRender = true) {
   try {
     const data = await api("/api/buckets");
     state.buckets = normalizeBuckets(data.items || []);
+    const hasCurrentBucket = state.buckets.some((bucket) => bucket.name === state.bucket);
+    if (state.bucket && !hasCurrentBucket) {
+      state.prefix = "";
+      state.bucket = "";
+    }
     if (!state.bucket && state.buckets.length) {
       state.bucket = state.buckets[0].name;
     }
     if (state.bucket) {
       await loadObjects(false);
     }
+    persistSession();
   } catch (error) {
     state.buckets = [];
     state.objects = [];
@@ -406,8 +517,30 @@ async function createBucket(form) {
     });
     form.reset();
     state.bucket = bucket;
+    state.prefix = "";
     await loadBuckets(false);
+    persistSession();
     setStatus("Bucket created.");
+  } catch (error) {
+    setStatus(error.message, true);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function createFolder(form) {
+  if (!state.activeProfile || !state.bucket) return;
+  setBusy(true);
+  const folder = new FormData(form).get("folder");
+  try {
+    const data = await api("/api/folder", {
+      method: "POST",
+      body: JSON.stringify({ bucket: state.bucket, prefix: state.prefix, folder }),
+    });
+    form.reset();
+    state.modal = null;
+    await loadObjects(false);
+    setStatus(`Folder created: ${data.key}`);
   } catch (error) {
     setStatus(error.message, true);
   } finally {
@@ -428,6 +561,7 @@ async function deleteBucket(bucket, force = false) {
       state.objects = [];
     }
     await loadBuckets(false);
+    persistSession();
     setStatus("Bucket deleted.");
   } catch (error) {
     setStatus(error.message, true);
@@ -442,6 +576,7 @@ async function loadObjects(shouldRender = true) {
   try {
     const data = await api(`/api/objects?bucket=${qs(state.bucket)}&prefix=${qs(state.prefix)}`);
     state.objects = normalizeObjects(data.items || []);
+    persistSession();
   } catch (error) {
     state.objects = [];
     setStatus(error.message, true);
@@ -482,17 +617,34 @@ function displayObjectName(key, isFolder) {
 
 async function uploadObject(input) {
   if (!state.activeProfile || !state.bucket || !input.files.length) return;
+  const files = Array.from(input.files);
+  state.status = `Uploading ${files.length} file${files.length === 1 ? "" : "s"}...`;
+  state.error = "";
   setBusy(true);
   const body = new FormData();
   body.append("profile", JSON.stringify(profileForRequest()));
   body.append("bucket", state.bucket);
   body.append("prefix", state.prefix);
-  body.append("file", input.files[0]);
+  files.forEach((file) => {
+    body.append("file", file, file.name);
+  });
   try {
-    await api("/api/upload", { method: "POST", body });
+    const response = await fetch("/api/upload", {
+      method: "POST",
+      body,
+    });
+    const data = await response.json();
     input.value = "";
     await loadObjects(false);
-    setStatus("Uploaded.");
+    const uploaded = Number(data.count || data.uploaded?.length || 0);
+    const failed = Number(data.failed?.length || 0);
+    if (!response.ok || data.ok === false) {
+      const failedNames = (data.failed || []).map((item) => item.name).filter(Boolean).slice(0, 5).join(", ");
+      const suffix = failedNames ? ` Failed: ${failedNames}${failed > 5 ? ", ..." : ""}` : "";
+      setStatus(`Uploaded ${uploaded}/${files.length} files.${suffix}`, true);
+      return;
+    }
+    setStatus(`Uploaded ${uploaded} file${uploaded === 1 ? "" : "s"}.`);
   } catch (error) {
     setStatus(error.message, true);
   } finally {
@@ -667,6 +819,7 @@ function render() {
         ${renderView()}
       </main>
     </div>
+    ${renderModal()}
   `;
   bindCommon();
   bindView();
@@ -772,27 +925,36 @@ function renderView() {
   return "";
 }
 
-function renderBucketSelect() {
+function renderBucketButton() {
   return `
-    <select id="bucket-select" ${state.busy ? "disabled" : ""}>
-      <option value="">Select bucket</option>
-      ${state.buckets
-        .map((bucket) => `<option value="${escapeHtml(bucket.name)}" ${bucket.name === state.bucket ? "selected" : ""}>${escapeHtml(bucket.name)}</option>`)
-        .join("")}
-    </select>
+    <button type="button" class="bucket-switch" data-action="open-bucket-modal" ${state.busy || !state.buckets.length ? "disabled" : ""}>
+      <span class="button-kicker">Bucket</span>
+      <strong class="ltr">${escapeHtml(state.bucket || "Select bucket")}</strong>
+      <span>Change</span>
+    </button>
   `;
 }
 
 function renderBrowser() {
+  const currentPrefix = state.prefix || "/";
   return `
     <section class="stack">
-      <div class="panel toolbar">
-        ${renderBucketSelect()}
-        <button data-action="refresh-objects" ${state.busy ? "disabled" : ""}>Refresh</button>
-        <label class="button-file">
-          <input id="upload-input" type="file" hidden />
-          <button type="button" data-action="pick-upload" class="primary" ${!state.bucket || state.busy ? "disabled" : ""}>Upload</button>
-        </label>
+      <div class="browser-header">
+        <div class="browser-context">
+          ${renderBucketButton()}
+          <div class="path-summary">
+            <span class="button-kicker">Prefix</span>
+            <strong class="ltr">${escapeHtml(currentPrefix)}</strong>
+          </div>
+        </div>
+        <div class="toolbar">
+          <button data-action="refresh-objects" ${!state.bucket || state.busy ? "disabled" : ""}>Refresh</button>
+          <button data-action="open-folder-modal" ${!state.bucket || state.busy ? "disabled" : ""}>Create Folder</button>
+          <label class="button-file">
+            <input id="upload-input" type="file" multiple hidden />
+            <button type="button" data-action="pick-upload" class="primary" ${!state.bucket || state.busy ? "disabled" : ""}>Upload</button>
+          </label>
+        </div>
       </div>
       <div class="panel crumbs">
         ${renderCrumbs()}
@@ -928,7 +1090,7 @@ function renderPolicies() {
   return `
     <section class="stack">
       <div class="panel toolbar">
-        ${renderBucketSelect()}
+        ${renderBucketButton()}
         <button data-action="load-policy" ${!state.bucket || state.busy ? "disabled" : ""}>Load</button>
       </div>
       <div class="panel policy-actions">
@@ -938,6 +1100,72 @@ function renderPolicies() {
       </div>
       <pre class="output">${escapeHtml(state.policyText || state.output || "")}</pre>
     </section>
+  `;
+}
+
+function renderModal() {
+  if (!state.modal) return "";
+  if (state.modal === "bucket") return renderBucketModal();
+  if (state.modal === "folder") return renderFolderModal();
+  return "";
+}
+
+function renderBucketModal() {
+  return `
+    <div class="modal-backdrop" data-modal-backdrop>
+      <section class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="bucket-modal-title">
+        <header class="modal-header">
+          <div>
+            <h2 id="bucket-modal-title">Select Bucket</h2>
+            <p class="muted">${state.buckets.length} available buckets</p>
+          </div>
+          <button type="button" class="icon-button" data-modal-close aria-label="Close">×</button>
+        </header>
+        <div class="bucket-card-grid">
+          ${
+            state.buckets
+              .map(
+                (bucket) => `
+                  <button type="button" class="bucket-card ${bucket.name === state.bucket ? "selected" : ""}" data-select-bucket="${escapeHtml(bucket.name)}">
+                    <span class="bucket-card-top">
+                      <strong class="ltr">${escapeHtml(bucket.name)}</strong>
+                      ${bucket.name === state.bucket ? '<span class="badge">Current</span>' : ""}
+                    </span>
+                    <span class="muted ltr">${escapeHtml(bucket.updated || "No modified date")}</span>
+                    <span class="bucket-card-action">${bucket.name === state.bucket ? "Selected" : "Open bucket"}</span>
+                  </button>
+                `
+              )
+              .join("") || `<div class="empty">No buckets found.</div>`
+          }
+        </div>
+      </section>
+    </div>
+  `;
+}
+
+function renderFolderModal() {
+  return `
+    <div class="modal-backdrop" data-modal-backdrop>
+      <section class="modal-panel compact" role="dialog" aria-modal="true" aria-labelledby="folder-modal-title">
+        <header class="modal-header">
+          <div>
+            <h2 id="folder-modal-title">Create Folder</h2>
+            <p class="muted ltr">${escapeHtml(state.bucket || "")}/${escapeHtml(state.prefix || "")}</p>
+          </div>
+          <button type="button" class="icon-button" data-modal-close aria-label="Close">×</button>
+        </header>
+        <form id="folder-create-form">
+          <label>Folder Name
+            <input class="ltr" name="folder" placeholder="reports" required autocomplete="off" ${!state.bucket || state.busy ? "disabled" : ""} />
+          </label>
+          <div class="modal-actions">
+            <button type="button" data-modal-close>Cancel</button>
+            <button class="primary" ${!state.bucket || state.busy ? "disabled" : ""}>Create</button>
+          </div>
+        </form>
+      </section>
+    </div>
   `;
 }
 
@@ -997,6 +1225,7 @@ function bindCommon() {
       state.view = button.dataset.nav;
       state.status = "";
       state.error = "";
+      persistSession();
       render();
     });
   });
@@ -1007,30 +1236,50 @@ function bindCommon() {
     state.objects = [];
     state.status = "";
     state.error = "";
+    state.modal = null;
+    persistSession();
     render();
+  });
+  document.querySelectorAll("[data-modal-close]").forEach((button) => {
+    button.addEventListener("click", closeModal);
+  });
+  document.querySelector("[data-modal-backdrop]")?.addEventListener("click", (event) => {
+    if (event.target === event.currentTarget) {
+      closeModal();
+    }
   });
 }
 
 function bindView() {
-  document.querySelector("#bucket-select")?.addEventListener("change", async (event) => {
-    state.bucket = event.target.value;
-    state.prefix = "";
-    await loadObjects();
+  document.querySelectorAll("[data-action=open-bucket-modal]").forEach((button) => {
+    button.addEventListener("click", () => openModal("bucket"));
+  });
+  document.querySelectorAll("[data-action=open-folder-modal]").forEach((button) => {
+    button.addEventListener("click", () => openModal("folder"));
+  });
+  document.querySelectorAll("[data-select-bucket]").forEach((button) => {
+    button.addEventListener("click", () => selectBucket(button.dataset.selectBucket));
   });
   document.querySelector("[data-action=refresh-objects]")?.addEventListener("click", () => loadObjects());
   document.querySelector("[data-action=pick-upload]")?.addEventListener("click", () => {
     document.querySelector("#upload-input")?.click();
   });
   document.querySelector("#upload-input")?.addEventListener("change", (event) => uploadObject(event.target));
+  document.querySelector("#folder-create-form")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    createFolder(event.currentTarget);
+  });
   document.querySelectorAll("[data-open-prefix]").forEach((button) => {
     button.addEventListener("click", async () => {
       state.prefix = button.dataset.openPrefix;
+      persistSession();
       await loadObjects();
     });
   });
   document.querySelectorAll("[data-prefix]").forEach((button) => {
     button.addEventListener("click", async () => {
       state.prefix = button.dataset.prefix;
+      persistSession();
       await loadObjects();
     });
   });
@@ -1052,10 +1301,9 @@ function bindView() {
   });
   document.querySelectorAll("[data-use-bucket]").forEach((button) => {
     button.addEventListener("click", async () => {
-      state.bucket = button.dataset.useBucket;
-      state.prefix = "";
       state.view = "browser";
-      await loadObjects();
+      persistSession();
+      await selectBucket(button.dataset.useBucket);
     });
   });
   document.querySelector("[data-action=load-policy]")?.addEventListener("click", () => loadPolicy());

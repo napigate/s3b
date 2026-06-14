@@ -43,7 +43,8 @@ PYTHON_IMAGE=your-registry/python:3.12-alpine docker compose up --build
 - SeaweedFS profile preset with path-style S3 lookup
 - Persist profiles in the browser for later sessions
 - Browse buckets and objects
-- Upload, download, and delete objects
+- Create folder markers in the current prefix
+- Upload one or many files, download objects, and delete objects
 - Create and delete buckets
 - Configure MinIO anonymous bucket policies when using a MinIO profile
 - Run direct `mc` commands with the `{alias}` placeholder

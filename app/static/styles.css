@@ -1,19 +1,23 @@
 :root {
   color-scheme: light;
-  --bg: #f5f3ef;
+  --bg: #f4f7fb;
   --surface: #ffffff;
-  --surface-soft: #f9faf7;
-  --text: #1f241f;
-  --muted: #6c716b;
-  --border: #d9ddd4;
-  --accent: #167c6b;
-  --accent-dark: #0f5f52;
+  --surface-soft: #f8fafc;
+  --surface-strong: #eef4f8;
+  --text: #172033;
+  --muted: #667085;
+  --border: #d8dee8;
+  --accent: #0f766e;
+  --accent-dark: #115e59;
+  --accent-soft: #e7f5f3;
+  --blue: #2563eb;
   --danger: #b42318;
-  --warning: #c76a15;
-  --code-bg: #1d211c;
-  --code-text: #eff6ed;
-  --shadow: 0 14px 40px rgba(26, 31, 26, 0.08);
-  font-family: Tahoma, Arial, sans-serif;
+  --warning: #b45309;
+  --code-bg: #101828;
+  --code-text: #f2f4f7;
+  --shadow: 0 16px 44px rgba(16, 24, 40, 0.08);
+  --shadow-strong: 0 24px 70px rgba(16, 24, 40, 0.18);
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
 }
 
 * {
@@ -23,7 +27,9 @@
 body {
   min-height: 100vh;
   margin: 0;
-  background: var(--bg);
+  background:
+    linear-gradient(180deg, rgba(231, 245, 243, 0.7), rgba(244, 247, 251, 0) 260px),
+    var(--bg);
   color: var(--text);
   font-size: 14px;
 }
@@ -41,12 +47,15 @@ button {
   background: var(--surface);
   color: var(--text);
   cursor: pointer;
-  min-height: 36px;
-  padding: 0 12px;
+  min-height: 38px;
+  padding: 0 13px;
+  font-weight: 600;
+  transition: border-color 0.16s ease, background 0.16s ease, color 0.16s ease, transform 0.16s ease;
 }
 
 button:hover {
-  border-color: #9faf9f;
+  border-color: #a9b7c9;
+  background: var(--surface-soft);
 }
 
 button:disabled {
@@ -81,17 +90,18 @@ button:disabled {
 
 .app-shell {
   display: grid;
-  grid-template-columns: 240px 1fr;
+  grid-template-columns: 260px minmax(0, 1fr);
   min-height: 100vh;
 }
 
 .sidebar {
-  background: #252a23;
-  color: #eef3eb;
-  padding: 18px 14px;
+  background: #183230;
+  color: #eef8f7;
+  padding: 20px 16px;
   display: flex;
   flex-direction: column;
   gap: 16px;
+  box-shadow: 8px 0 28px rgba(16, 24, 40, 0.08);
 }
 
 .brand {
@@ -108,9 +118,10 @@ button:disabled {
 }
 
 .profile-pill {
-  color: #cfd8ca;
+  color: #bddbd6;
   font-size: 12px;
   word-break: break-word;
+  margin-top: 5px;
 }
 
 .nav {
@@ -128,8 +139,8 @@ button:disabled {
 
 .nav button.active,
 .nav button:hover {
-  background: rgba(255, 255, 255, 0.1);
-  border-color: rgba(255, 255, 255, 0.1);
+  background: rgba(255, 255, 255, 0.12);
+  border-color: rgba(255, 255, 255, 0.16);
 }
 
 .sidebar .ghost {
@@ -141,7 +152,7 @@ button:disabled {
 
 .main {
   min-width: 0;
-  padding: 22px;
+  padding: 24px;
 }
 
 .topbar,
@@ -158,7 +169,7 @@ button:disabled {
 
 .topbar {
   justify-content: space-between;
-  margin-bottom: 16px;
+  margin-bottom: 18px;
 }
 
 h1,
@@ -192,6 +203,79 @@ h3 {
 
 .panel {
   padding: 16px;
+}
+
+.browser-header {
+  display: flex;
+  align-items: stretch;
+  justify-content: space-between;
+  gap: 14px;
+  flex-wrap: wrap;
+  padding: 14px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+}
+
+.browser-context {
+  display: flex;
+  align-items: stretch;
+  gap: 10px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.bucket-switch,
+.path-summary {
+  min-width: 230px;
+  min-height: 58px;
+  display: grid;
+  align-content: center;
+  gap: 3px;
+  padding: 9px 12px;
+  border-radius: 8px;
+  background: var(--surface-soft);
+  border: 1px solid var(--border);
+  text-align: left;
+}
+
+.bucket-switch {
+  grid-template-columns: minmax(0, 1fr) auto;
+  column-gap: 12px;
+}
+
+.bucket-switch .button-kicker,
+.bucket-switch strong {
+  grid-column: 1;
+}
+
+.bucket-switch > span:last-child {
+  grid-row: 1 / span 2;
+  grid-column: 2;
+  align-self: center;
+  color: var(--blue);
+  font-size: 12px;
+}
+
+.bucket-switch:hover {
+  border-color: rgba(15, 118, 110, 0.45);
+  background: var(--accent-soft);
+}
+
+.button-kicker {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0;
+}
+
+.path-summary strong,
+.bucket-switch strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .login-wrap {
@@ -244,6 +328,17 @@ h3 {
 form {
   display: grid;
   gap: 12px;
+}
+
+.inline-form {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.inline-form input {
+  width: 180px;
 }
 
 label {
@@ -394,6 +489,102 @@ tr:last-child td {
   gap: 14px;
 }
 
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  padding: 22px;
+  background: rgba(16, 24, 40, 0.48);
+}
+
+.modal-panel {
+  width: min(760px, 100%);
+  max-height: min(720px, calc(100vh - 44px));
+  overflow: auto;
+  background: var(--surface);
+  border: 1px solid rgba(216, 222, 232, 0.8);
+  border-radius: 8px;
+  box-shadow: var(--shadow-strong);
+  padding: 16px;
+}
+
+.modal-panel.compact {
+  width: min(460px, 100%);
+}
+
+.modal-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 14px;
+}
+
+.icon-button {
+  width: 36px;
+  min-width: 36px;
+  min-height: 36px;
+  padding: 0;
+  display: inline-grid;
+  place-items: center;
+  font-size: 22px;
+  line-height: 1;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.bucket-card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  gap: 10px;
+}
+
+.bucket-card {
+  min-height: 128px;
+  display: grid;
+  align-content: space-between;
+  gap: 10px;
+  padding: 13px;
+  border-radius: 8px;
+  text-align: left;
+  background: var(--surface-soft);
+}
+
+.bucket-card:hover,
+.bucket-card.selected {
+  border-color: rgba(15, 118, 110, 0.5);
+  background: var(--accent-soft);
+}
+
+.bucket-card-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+}
+
+.bucket-card-top strong {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.bucket-card-action {
+  color: var(--blue);
+  font-size: 12px;
+  font-weight: 700;
+}
+
 @media (max-width: 860px) {
   .app-shell,
   .login-grid,
@@ -408,5 +599,23 @@ tr:last-child td {
 
   .main {
     padding: 14px;
+  }
+
+  .browser-header,
+  .browser-context,
+  .toolbar {
+    display: grid;
+    grid-template-columns: 1fr;
+    width: 100%;
+  }
+
+  .bucket-switch,
+  .path-summary {
+    min-width: 0;
+    width: 100%;
+  }
+
+  .modal-backdrop {
+    padding: 12px;
   }
 }

@@ -174,6 +174,18 @@ def clean_key(key):
     return key
 
 
+def clean_folder_key(prefix, folder):
+    folder = clean_key(folder).strip("/")
+    if not folder:
+        raise ApiError(HTTPStatus.BAD_REQUEST, "Folder name is required.")
+    parts = [part for part in folder.split("/") if part]
+    if any(part in {".", ".."} for part in parts):
+        raise ApiError(HTTPStatus.BAD_REQUEST, "Folder name is invalid.")
+    base = clean_key(prefix).strip("/")
+    key = "/".join(part for part in [base, "/".join(parts)] if part)
+    return key.rstrip("/") + "/"
+
+
 def s3_target(profile, bucket=None, key=None):
     target = alias_for(profile)
     if bucket:
@@ -202,7 +214,7 @@ def run_mc(profile, args, timeout=120, check=True):
         return run_mc_raw(profile, args, config_dir, timeout=timeout, check=check)
 
 
-def run_mc_raw(profile, args, config_dir, timeout=120, check=True):
+def run_mc_raw(profile, args, config_dir, timeout=120, check=True, input_data=None):
     cmd = mc_base(profile) + list(args)
     try:
         result = subprocess.run(
@@ -211,6 +223,7 @@ def run_mc_raw(profile, args, config_dir, timeout=120, check=True):
             capture_output=True,
             text=True,
             timeout=timeout,
+            input=input_data,
         )
     except FileNotFoundError:
         raise ApiError(
@@ -314,6 +327,13 @@ def safe_upload_name(filename):
     if not filename:
         filename = f"upload-{int(time.time())}"
     return filename
+
+
+def form_file_fields(form, key):
+    fields = form[key] if key in form else []
+    if not isinstance(fields, list):
+        fields = [fields]
+    return [field for field in fields if getattr(field, "filename", None)]
 
 
 class ApiError(Exception):
@@ -472,6 +492,26 @@ class S3BrowserHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if path == "/api/folder":
+            payload = self.read_json()
+            profile = self.request_profile(payload)
+            bucket = validate_bucket(require_text(payload, "bucket", "Bucket name"))
+            folder_key = clean_folder_key(payload.get("prefix", ""), require_text(payload, "folder", "Folder name"))
+            with tempfile.TemporaryDirectory(prefix="s3b-mc-") as config_dir:
+                ensure_alias(profile, config_dir)
+                result = run_mc_raw(
+                    profile,
+                    ["pipe", s3_target(profile, bucket, folder_key)],
+                    config_dir,
+                    check=False,
+                    input_data="",
+                )
+            self.send_json(
+                {"ok": result["code"] == 0, "key": folder_key, **result},
+                HTTPStatus.OK if result["code"] == 0 else HTTPStatus.BAD_GATEWAY,
+            )
+            return
+
         if path == "/api/policy":
             payload = self.read_json()
             profile = self.request_profile(payload)
@@ -560,11 +600,37 @@ class S3BrowserHandler(BaseHTTPRequestHandler):
             profile = self.request_profile()
             bucket = validate_bucket(self.query_one(qs, "bucket"))
             key = clean_key(self.query_one(qs, "key"))
-            args = ["rm"]
-            if self.query_one(qs, "recursive", required=False) in {"1", "true", "yes"}:
-                args.extend(["--recursive", "--force"])
-            args.append(s3_target(profile, bucket, key))
-            result = run_mc(profile, args, check=False)
+            recursive = self.query_one(qs, "recursive", required=False) in {"1", "true", "yes"}
+            if recursive:
+                with tempfile.TemporaryDirectory(prefix="s3b-mc-") as config_dir:
+                    ensure_alias(profile, config_dir)
+                    result = run_mc_raw(
+                        profile,
+                        ["rm", "--recursive", "--force", s3_target(profile, bucket, key)],
+                        config_dir,
+                        check=False,
+                    )
+                    marker_key = key.rstrip("/") + "/"
+                    marker_result = run_mc_raw(
+                        profile,
+                        ["rm", "--force", s3_target(profile, bucket, marker_key)],
+                        config_dir,
+                        check=False,
+                    )
+                combined = {
+                    "ok": result["code"] == 0 and marker_result["code"] == 0,
+                    "code": result["code"] if result["code"] != 0 else marker_result["code"],
+                    "stdout": "\n".join(part for part in [result["stdout"], marker_result["stdout"]] if part),
+                    "stderr": "\n".join(part for part in [result["stderr"], marker_result["stderr"]] if part),
+                    "command": [result["command"], marker_result["command"]],
+                }
+                self.send_json(
+                    combined,
+                    HTTPStatus.OK if combined["ok"] else HTTPStatus.BAD_GATEWAY,
+                )
+                return
+
+            result = run_mc(profile, ["rm", s3_target(profile, bucket, key)], check=False)
             self.send_json(
                 {"ok": result["code"] == 0, **result},
                 HTTPStatus.OK if result["code"] == 0 else HTTPStatus.BAD_GATEWAY,
@@ -590,28 +656,58 @@ class S3BrowserHandler(BaseHTTPRequestHandler):
         profile = self.profile_from_form(form)
         bucket = validate_bucket(str(form.getvalue("bucket", "")))
         prefix = clean_key(str(form.getvalue("prefix", "")))
-        file_field = form["file"] if "file" in form else None
-        if file_field is None or not getattr(file_field, "filename", None):
+        file_fields = form_file_fields(form, "file")
+        if not file_fields:
             raise ApiError(HTTPStatus.BAD_REQUEST, "No file was selected.")
 
-        upload_name = safe_upload_name(file_field.filename)
-        object_key = "/".join(part for part in [prefix, upload_name] if part)
-        tmp_path = None
-        try:
-            with tempfile.NamedTemporaryFile(delete=False) as tmp:
-                tmp_path = tmp.name
-                shutil.copyfileobj(file_field.file, tmp)
-            result = run_mc(profile, ["cp", tmp_path, s3_target(profile, bucket, object_key)], check=False)
-            self.send_json(
-                {"ok": result["code"] == 0, "key": object_key, **result},
-                HTTPStatus.OK if result["code"] == 0 else HTTPStatus.BAD_GATEWAY,
-            )
-        finally:
-            if tmp_path:
+        uploaded = []
+        failed = []
+        with tempfile.TemporaryDirectory(prefix="s3b-mc-") as config_dir:
+            ensure_alias(profile, config_dir)
+            for file_field in file_fields:
+                upload_name = safe_upload_name(file_field.filename)
+                object_key = "/".join(part for part in [prefix, upload_name] if part)
+                tmp_path = None
                 try:
-                    os.unlink(tmp_path)
-                except FileNotFoundError:
-                    pass
+                    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+                        tmp_path = tmp.name
+                        shutil.copyfileobj(file_field.file, tmp)
+                    result = run_mc_raw(
+                        profile,
+                        ["cp", tmp_path, s3_target(profile, bucket, object_key)],
+                        config_dir,
+                        check=False,
+                    )
+                    row = {
+                        "name": upload_name,
+                        "key": object_key,
+                        "code": result["code"],
+                        "stdout": result["stdout"],
+                        "stderr": result["stderr"],
+                        "command": result["command"],
+                    }
+                    if result["code"] == 0:
+                        uploaded.append(row)
+                    else:
+                        failed.append(row)
+                finally:
+                    if tmp_path:
+                        try:
+                            os.unlink(tmp_path)
+                        except FileNotFoundError:
+                            pass
+
+        self.send_json(
+            {
+                "ok": not failed,
+                "uploaded": uploaded,
+                "failed": failed,
+                "count": len(uploaded),
+                "total": len(file_fields),
+                "stderr": "\n".join(item["stderr"] for item in failed if item.get("stderr")),
+            },
+            HTTPStatus.OK if not failed else HTTPStatus.BAD_GATEWAY,
+        )
 
     def handle_download(self, profile, payload):
         bucket = validate_bucket(str(payload.get("bucket", "")))
