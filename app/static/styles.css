@@ -456,6 +456,50 @@ tr:last-child td {
   color: var(--danger);
 }
 
+.upload-progress {
+  display: grid;
+  gap: 9px;
+}
+
+.upload-progress-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+}
+
+.progress-track {
+  height: 10px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--surface-strong);
+}
+
+.progress-track span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width 0.15s ease;
+}
+
+.share-result {
+  display: grid;
+  gap: 10px;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+
+.share-url {
+  min-height: 92px;
+  word-break: break-all;
+}
+
+.share-note {
+  margin-top: 14px;
+}
+
 .output {
   margin: 0;
   padding: 12px;

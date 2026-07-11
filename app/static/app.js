@@ -13,6 +13,10 @@ const state = {
   status: "",
   error: "",
   busy: false,
+  uploadProgress: null,
+  shareKey: "",
+  shareUrl: "",
+  shareExpiry: "24h",
 };
 
 const app = document.querySelector("#app");
@@ -618,9 +622,6 @@ function displayObjectName(key, isFolder) {
 async function uploadObject(input) {
   if (!state.activeProfile || !state.bucket || !input.files.length) return;
   const files = Array.from(input.files);
-  state.status = `Uploading ${files.length} file${files.length === 1 ? "" : "s"}...`;
-  state.error = "";
-  setBusy(true);
   const body = new FormData();
   body.append("profile", JSON.stringify(profileForRequest()));
   body.append("bucket", state.bucket);
@@ -628,19 +629,34 @@ async function uploadObject(input) {
   files.forEach((file) => {
     body.append("file", file, file.name);
   });
+  state.status = "";
+  state.error = "";
+  state.busy = true;
+  state.uploadProgress = {
+    percent: 0,
+    loaded: 0,
+    total: files.reduce((total, file) => total + file.size, 0),
+    phase: "uploading",
+    files: files.length,
+  };
+  render();
   try {
-    const response = await fetch("/api/upload", {
-      method: "POST",
-      body,
+    const { response, data } = await uploadWithProgress(body, (loaded, total, phase = "uploading") => {
+      const percent = total > 0 ? Math.min(100, Math.round((loaded / total) * 100)) : 0;
+      state.uploadProgress = { percent, loaded, total, phase, files: files.length };
+      updateUploadProgress();
     });
-    const data = await response.json();
-    input.value = "";
     await loadObjects(false);
     const uploaded = Number(data.count || data.uploaded?.length || 0);
     const failed = Number(data.failed?.length || 0);
     if (!response.ok || data.ok === false) {
       const failedNames = (data.failed || []).map((item) => item.name).filter(Boolean).slice(0, 5).join(", ");
-      const suffix = failedNames ? ` Failed: ${failedNames}${failed > 5 ? ", ..." : ""}` : "";
+      const detail = data.error || data.stderr || "";
+      const suffix = failedNames
+        ? ` Failed: ${failedNames}${failed > 5 ? ", ..." : ""}`
+        : detail
+          ? ` ${detail}`
+          : "";
       setStatus(`Uploaded ${uploaded}/${files.length} files.${suffix}`, true);
       return;
     }
@@ -648,7 +664,50 @@ async function uploadObject(input) {
   } catch (error) {
     setStatus(error.message, true);
   } finally {
-    setBusy(false);
+    state.uploadProgress = null;
+    state.busy = false;
+    render();
+  }
+}
+
+function uploadWithProgress(body, onProgress) {
+  return new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest();
+    request.open("POST", "/api/upload");
+    request.responseType = "json";
+    request.upload.addEventListener("progress", (event) => {
+      if (event.lengthComputable) {
+        onProgress(event.loaded, event.total);
+      }
+    });
+    request.upload.addEventListener("load", (event) => {
+      onProgress(event.loaded, event.total || event.loaded, "finalizing");
+    });
+    request.addEventListener("load", () => {
+      const data = request.response || {};
+      resolve({
+        response: { ok: request.status >= 200 && request.status < 300 },
+        data,
+      });
+    });
+    request.addEventListener("error", () => reject(new Error("The upload connection failed.")));
+    request.addEventListener("abort", () => reject(new Error("The upload was canceled.")));
+    request.send(body);
+  });
+}
+
+function updateUploadProgress() {
+  const progress = state.uploadProgress;
+  if (!progress) return;
+  const bar = document.querySelector("[data-upload-progress-bar]");
+  const value = document.querySelector("[data-upload-progress-value]");
+  const detail = document.querySelector("[data-upload-progress-detail]");
+  if (bar) bar.style.width = `${progress.percent}%`;
+  if (value) value.textContent = progress.phase === "finalizing" ? "Finalizing..." : `${progress.percent}%`;
+  if (detail) {
+    detail.textContent = progress.phase === "finalizing"
+      ? "Transfer complete. Waiting for storage confirmation."
+      : `${formatSize(progress.loaded)} of ${formatSize(progress.total)}`;
   }
 }
 
@@ -697,6 +756,44 @@ async function downloadObject(key) {
   } finally {
     setBusy(false);
   }
+}
+
+function openShareModal(key) {
+  state.shareKey = key;
+  state.shareUrl = "";
+  state.shareExpiry = "24h";
+  openModal("share");
+}
+
+async function createShare(form) {
+  if (!state.activeProfile || !state.bucket || !state.shareKey) return;
+  state.shareExpiry = String(new FormData(form).get("expiry") || "24h");
+  setBusy(true);
+  try {
+    const data = await api("/api/share", {
+      method: "POST",
+      body: JSON.stringify({ bucket: state.bucket, key: state.shareKey, expiry: state.shareExpiry }),
+    });
+    state.shareUrl = data.url || "";
+    setStatus("Share link created.");
+  } catch (error) {
+    state.shareUrl = "";
+    setStatus(error.message, true);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function copyShareUrl() {
+  if (!state.shareUrl) return;
+  try {
+    await navigator.clipboard.writeText(state.shareUrl);
+  } catch {
+    const field = document.querySelector("#share-url");
+    field?.select();
+    document.execCommand("copy");
+  }
+  setStatus("Share link copied.");
 }
 
 async function loadPolicy() {
@@ -956,6 +1053,7 @@ function renderBrowser() {
           </label>
         </div>
       </div>
+      ${renderUploadProgress()}
       <div class="panel crumbs">
         ${renderCrumbs()}
       </div>
@@ -980,6 +1078,27 @@ function renderBrowser() {
         </table>
       </div>
     </section>
+  `;
+}
+
+function renderUploadProgress() {
+  const progress = state.uploadProgress;
+  if (!progress) return "";
+  const title = progress.phase === "finalizing" ? "Finalizing upload..." : `Uploading ${progress.files} file${progress.files === 1 ? "" : "s"}`;
+  const detail = progress.phase === "finalizing"
+    ? "Transfer complete. Waiting for storage confirmation."
+    : `${formatSize(progress.loaded)} of ${formatSize(progress.total)}`;
+  return `
+    <div class="panel upload-progress" role="status" aria-live="polite">
+      <div class="upload-progress-header">
+        <strong>${escapeHtml(title)}</strong>
+        <span data-upload-progress-value>${progress.phase === "finalizing" ? "Finalizing..." : `${progress.percent}%`}</span>
+      </div>
+      <div class="progress-track" aria-hidden="true">
+        <span data-upload-progress-bar style="width: ${progress.percent}%"></span>
+      </div>
+      <div class="muted ltr" data-upload-progress-detail>${escapeHtml(detail)}</div>
+    </div>
   `;
 }
 
@@ -1010,7 +1129,7 @@ function renderObjectRow(item) {
       <td class="ltr">${escapeHtml(item.updated || "-")}</td>
       <td>
         <div class="row-actions">
-          ${item.isFolder ? "" : `<button data-download="${key}">Download</button>`}
+          ${item.isFolder ? "" : `<button data-download="${key}">Download</button><button data-share="${key}">Share</button>`}
           <button class="danger" data-delete-object="${key}" data-recursive="${item.isFolder ? "1" : "0"}">Delete</button>
         </div>
       </td>
@@ -1107,6 +1226,7 @@ function renderModal() {
   if (!state.modal) return "";
   if (state.modal === "bucket") return renderBucketModal();
   if (state.modal === "folder") return renderFolderModal();
+  if (state.modal === "share") return renderShareModal();
   return "";
 }
 
@@ -1164,6 +1284,43 @@ function renderFolderModal() {
             <button class="primary" ${!state.bucket || state.busy ? "disabled" : ""}>Create</button>
           </div>
         </form>
+      </section>
+    </div>
+  `;
+}
+
+function renderShareModal() {
+  return `
+    <div class="modal-backdrop" data-modal-backdrop>
+      <section class="modal-panel compact" role="dialog" aria-modal="true" aria-labelledby="share-modal-title">
+        <header class="modal-header">
+          <div>
+            <h2 id="share-modal-title">Share Object</h2>
+            <p class="muted ltr">${escapeHtml(state.bucket)}/${escapeHtml(state.shareKey)}</p>
+          </div>
+          <button type="button" class="icon-button" data-modal-close aria-label="Close">×</button>
+        </header>
+        <form id="share-form">
+          <label>Link Expiry
+            <select name="expiry" ${state.busy ? "disabled" : ""}>
+              <option value="1h" ${state.shareExpiry === "1h" ? "selected" : ""}>1 hour</option>
+              <option value="24h" ${state.shareExpiry === "24h" ? "selected" : ""}>24 hours</option>
+              <option value="168h" ${state.shareExpiry === "168h" ? "selected" : ""}>7 days</option>
+            </select>
+          </label>
+          <button class="primary" ${state.busy ? "disabled" : ""}>Generate Link</button>
+        </form>
+        ${
+          state.shareUrl
+            ? `<div class="share-result">
+                <label>Public Share Link
+                  <textarea id="share-url" class="share-url" readonly>${escapeHtml(state.shareUrl)}</textarea>
+                </label>
+                <button type="button" data-action="copy-share">Copy Link</button>
+                <p class="muted">Anyone with this link can download the object until it expires.</p>
+              </div>`
+            : `<p class="muted share-note">The link is signed with the active profile and does not change the bucket policy.</p>`
+        }
       </section>
     </div>
   `;
@@ -1286,6 +1443,14 @@ function bindView() {
   document.querySelectorAll("[data-download]").forEach((button) => {
     button.addEventListener("click", () => downloadObject(button.dataset.download));
   });
+  document.querySelectorAll("[data-share]").forEach((button) => {
+    button.addEventListener("click", () => openShareModal(button.dataset.share));
+  });
+  document.querySelector("#share-form")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    createShare(event.currentTarget);
+  });
+  document.querySelector("[data-action=copy-share]")?.addEventListener("click", copyShareUrl);
   document.querySelectorAll("[data-delete-object]").forEach((button) => {
     button.addEventListener("click", () => deleteObject(button.dataset.deleteObject, button.dataset.recursive === "1"));
   });

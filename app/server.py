@@ -33,6 +33,7 @@ BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$")
 ALIAS_RE = re.compile(r"[^A-Za-z0-9]+")
 PROVIDERS = {"generic", "minio", "seaweedfs"}
 PATH_STYLES = {"auto", "on", "off"}
+SHARE_EXPIRIES = {"1h", "24h", "168h"}
 
 
 def now_iso():
@@ -322,6 +323,32 @@ def parse_json_lines(stdout):
     return rows
 
 
+def normalize_share_expiry(value):
+    expiry = str(value or "24h").strip().lower()
+    if expiry not in SHARE_EXPIRIES:
+        raise ApiError(HTTPStatus.BAD_REQUEST, "Share expiry must be 1 hour, 24 hours, or 7 days.")
+    return expiry
+
+
+def extract_share_url(stdout):
+    rows = parse_json_lines(stdout)
+    for row in rows:
+        if isinstance(row, dict):
+            for key in ("share", "shareURL", "shareUrl", "url"):
+                value = row.get(key)
+                if isinstance(value, str) and value.startswith(("http://", "https://")):
+                    return value
+
+    for line in stdout.splitlines():
+        match = re.match(r"\s*Share:\s*(https?://\S+)\s*$", line, re.IGNORECASE)
+        if match:
+            return match.group(1)
+
+    urls = re.findall(r"https?://[^\s\"']+", stdout)
+    signed_urls = [url for url in urls if "X-Amz-" in url or "X-Minio-" in url]
+    return signed_urls[0] if signed_urls else ""
+
+
 def safe_upload_name(filename):
     filename = Path(filename or "").name.strip()
     if not filename:
@@ -557,6 +584,30 @@ class S3BrowserHandler(BaseHTTPRequestHandler):
             payload = self.read_json()
             profile = self.request_profile(payload)
             self.handle_download(profile, payload)
+            return
+
+        if path == "/api/share":
+            payload = self.read_json()
+            profile = self.request_profile(payload)
+            bucket = validate_bucket(require_text(payload, "bucket", "Bucket name"))
+            key = clean_key(require_text(payload, "key", "Object key"))
+            expiry = normalize_share_expiry(payload.get("expiry"))
+            result = run_mc(
+                profile,
+                ["share", "download", "--json", f"--expire={expiry}", s3_target(profile, bucket, key)],
+                check=False,
+            )
+            share_url = extract_share_url(result["stdout"])
+            ok = result["code"] == 0 and bool(share_url)
+            self.send_json(
+                {
+                    "ok": ok,
+                    "url": share_url,
+                    "expiry": expiry,
+                    "stderr": result["stderr"] or ("mc did not return a share URL." if result["code"] == 0 else ""),
+                },
+                HTTPStatus.OK if ok else HTTPStatus.BAD_GATEWAY,
+            )
             return
 
         raise ApiError(HTTPStatus.NOT_FOUND, "API route was not found.")

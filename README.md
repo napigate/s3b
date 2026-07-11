@@ -44,7 +44,8 @@ PYTHON_IMAGE=your-registry/python:3.12-alpine docker compose up --build
 - Persist profiles in the browser for later sessions
 - Browse buckets and objects
 - Create folder markers in the current prefix
-- Upload one or many files, download objects, and delete objects
+- Upload one or many files with visible progress, download objects, and delete objects
+- Generate time-limited public download links for individual objects
 - Create and delete buckets
 - Configure MinIO anonymous bucket policies when using a MinIO profile
 - Run direct `mc` commands with the `{alias}` placeholder
