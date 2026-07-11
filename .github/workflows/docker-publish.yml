@@ -1,0 +1,105 @@
+name: Build and Publish Docker Image
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: docker-publish-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
+
+jobs:
+  test:
+    name: Test Image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Run static checks
+        run: |
+          python3 -m py_compile app/server.py
+          node --check app/static/app.js
+          docker compose config >/dev/null
+
+      - name: Build smoke-test image
+        run: docker build --tag s3b:test .
+
+      - name: Run smoke test
+        run: |
+          docker run --detach --name s3b-test --user 1000:1000 --publish 18088:8080 s3b:test
+          for attempt in {1..30}; do
+            if curl -fsS http://127.0.0.1:18088/api/health > /tmp/s3b-health.json; then
+              break
+            fi
+            sleep 1
+          done
+          python3 -c 'import json; data=json.load(open("/tmp/s3b-health.json")); assert data == {"ok": True, "mc": True}, data'
+
+      - name: Show smoke-test logs on failure
+        if: failure()
+        run: docker logs s3b-test || true
+
+      - name: Stop smoke-test container
+        if: always()
+        run: docker rm --force s3b-test >/dev/null 2>&1 || true
+
+  publish:
+    name: Publish Multi-Architecture Image
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate image metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          flavor: |
+            latest=false
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+            type=sha,prefix=sha-
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: mode=max
+          sbom: true

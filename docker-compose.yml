@@ -1,5 +1,6 @@
 services:
   s3b:
+    image: ${S3B_IMAGE:-ghcr.io/napigate/s3b:latest}
     build:
       context: .
       args:

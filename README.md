@@ -26,6 +26,28 @@ After startup:
 http://localhost:8088
 ```
 
+## Deploy the Published Image
+
+Every push to `main` publishes multi-architecture images for `linux/amd64` and
+`linux/arm64` to GitHub Container Registry. The default deployment image is:
+
+```text
+ghcr.io/napigate/s3b:latest
+```
+
+Deploy or update it without building on the server:
+
+```bash
+cp .env.example .env
+docker compose pull
+docker compose up -d --no-build
+curl -fsS http://127.0.0.1:8088/api/health
+```
+
+Pushes to `main` publish `latest` and `sha-<commit>` tags. Git tags such as
+`v1.2.3` additionally publish `1.2.3` and `1.2` tags. If the GHCR package is
+private, log in with a GitHub token that has `read:packages` before pulling.
+
 Profiles are stored in the current browser with IndexedDB. They are not stored
 in `./data` and are not shared with other users who open the same S3B server
 from another browser. The backend receives the active profile credentials per
