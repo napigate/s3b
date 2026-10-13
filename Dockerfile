@@ -2,6 +2,7 @@ ARG PYTHON_IMAGE=python:3.12-alpine
 FROM ${PYTHON_IMAGE}
 
 ARG TARGETARCH
+ARG MC_VERSION=RELEASE.2025-08-13T08-35-41Z
 
 USER root
 
@@ -23,7 +24,12 @@ RUN set -eux; \
         arm64) mc_arch="arm64" ;; \
         *) echo "Unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
     esac; \
-    curl -fsSL "https://dl.min.io/client/mc/release/linux-${mc_arch}/mc" -o /usr/local/bin/mc; \
+    mc_url="https://github.com/minio/mc/releases/download/${MC_VERSION}/mc.linux-${mc_arch}.${MC_VERSION}"; \
+    curl -fsSL --retry 3 --connect-timeout 15 --max-time 180 "$mc_url" -o /usr/local/bin/mc; \
+    curl -fsSL --retry 3 --connect-timeout 15 --max-time 180 "${mc_url}.sha256sum" -o /tmp/mc.sha256sum; \
+    read -r mc_sha256 mc_filename < /tmp/mc.sha256sum; \
+    echo "$mc_sha256  /usr/local/bin/mc" | sha256sum -c -; \
+    rm /tmp/mc.sha256sum; \
     chmod +x /usr/local/bin/mc
 
 WORKDIR /app

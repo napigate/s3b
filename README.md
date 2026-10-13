@@ -59,6 +59,10 @@ If the default Docker registry is unavailable, override the base image:
 PYTHON_IMAGE=your-registry/python:3.12-alpine docker compose up --build
 ```
 
+The Docker build downloads a pinned `mc` version from GitHub Releases and checks
+its SHA-256 checksum. Building requires access to GitHub Releases as well as the
+Python image registry and the base image's package repositories.
+
 ## Features
 
 - Create and select profiles with provider, `endpoint`, `access key`, and `secret key`
